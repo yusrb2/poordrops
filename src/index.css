@@ -1,0 +1,175 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: 'Tsuki';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/tsuki/tsukimi-rounded-latin-400-normal.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Tsuki';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('./assets/fonts/tsuki/tsukimi-rounded-latin-600-normal.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Tsuki';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('./assets/fonts/tsuki/tsukimi-rounded-latin-700-normal.woff2') format('woff2');
+}
+
+:root {
+  --bg-kraft: #F5EFE6;
+  --surface-receipt: #FBF8F3;
+  --surface-inset: #EFE7DA;
+  --border-dashed: #CFC5B4;
+  --shadow-card: #DDD2C0;
+  --ink-primary: #24201C;
+  --ink-secondary: #6B6257;
+  --accent-airmail: #C85A32;
+  --accent-cleared: #3E6B48;
+  --accent-amber: #C98A2C;
+  --grain-opacity: 0.035;
+}
+
+.dark {
+  --bg-kraft: #171513;
+  --surface-receipt: #211E1B;
+  --surface-inset: #1C1917;
+  --border-dashed: #36312B;
+  --shadow-card: #0E0D0B;
+  --ink-primary: #EBE4D8;
+  --ink-secondary: #A69C8E;
+  --accent-airmail: #E06D44;
+  --accent-cleared: #689F74;
+  --accent-amber: #DCA043;
+  --grain-opacity: 0.045;
+}
+
+@layer base {
+  html {
+    background-color: var(--bg-kraft);
+    color: var(--ink-primary);
+    font-family: 'Nunito', system-ui, -apple-system, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    min-height: 100dvh;
+    background-color: var(--bg-kraft);
+    color: var(--ink-primary);
+    position: relative;
+    overflow-x: hidden;
+  }
+
+  /* Subtle organic SVG paper grain overlay */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    opacity: var(--grain-opacity);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' viewBox='0 0 180 180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)' opacity='1'/%3E%3C/svg%3E");
+  }
+}
+
+.font-display-tsuki {
+  font-family: 'Tsuki', 'Nunito', sans-serif;
+}
+
+.tabular-mono {
+  font-family: 'Courier Prime', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.receipt-card {
+  background-color: var(--surface-receipt);
+  border: 1.5px dashed var(--border-dashed);
+  box-shadow: 0 3px 0 var(--shadow-card);
+  border-radius: 6px;
+}
+
+.tactile-btn {
+  transition: transform 80ms ease, box-shadow 80ms ease, background-color 120ms ease;
+  box-shadow: 0 3px 0 var(--shadow-card);
+}
+
+.tactile-btn:active:not(:disabled) {
+  transform: translateY(2px);
+  box-shadow: 0 1px 0 var(--shadow-card);
+}
+
+.airmail-stripe {
+  height: 5px;
+  width: 100%;
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--accent-airmail) 0px,
+    var(--accent-airmail) 10px,
+    transparent 10px,
+    transparent 16px,
+    var(--accent-cleared) 16px,
+    var(--accent-cleared) 26px,
+    transparent 26px,
+    transparent 32px
+  );
+  opacity: 0.85;
+}
+
+.receipt-serrated {
+  position: relative;
+}
+
+.receipt-serrated::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -7px;
+  height: 7px;
+  background-image: radial-gradient(circle at 6px 7px, var(--bg-kraft) 5px, transparent 5.5px);
+  background-size: 12px 7px;
+  background-repeat: repeat-x;
+  pointer-events: none;
+}
+
+@keyframes stampSettle {
+  0% {
+    opacity: 0;
+    transform: scale(1.65) rotate(-14deg);
+  }
+  65% {
+    opacity: 1;
+    transform: scale(0.95) rotate(-3deg);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) rotate(-4deg);
+  }
+}
+
+.stamp-settle {
+  animation: stampSettle 340ms cubic-bezier(0.34, 1.35, 0.64, 1) forwards;
+}
+
+@keyframes snappySlideIn {
+  0% {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.snappy-enter {
+  animation: snappySlideIn 260ms cubic-bezier(0.34, 1.35, 0.64, 1) forwards;
+}

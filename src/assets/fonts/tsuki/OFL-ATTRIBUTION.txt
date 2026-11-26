@@ -1,0 +1,6 @@
+Tsuki Display Font Fallback Notice
+=================================
+The commercial "Tsuki" typeface is proprietary and incompatible with a GNU GPL-3.0 offline bundle.
+Per project specification, this directory bundles Tsukimi Rounded (SIL Open Font License 1.1)
+from @fontsource/tsukimi-rounded locally in WOFF2 format under the local @font-face family 'Tsuki'
+so PoorDrops works 100% offline with zero external CDN requests.
