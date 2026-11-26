@@ -85,7 +85,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" release-apks/*.apk \
+          gh release upload "${{ github.ref_name }}" release-apks/*.apk --clobber 2>/dev/null || gh release create "${{ github.ref_name }}" release-apks/*.apk \
             --title "PoorDrops ${{ github.ref_name }}" \
             --notes "Zero-server P2P file & clipboard transfer — AirDrop without the ecosystem tax." \
-            --overwrite || gh release upload "${{ github.ref_name }}" release-apks/*.apk --clobber
+             || gh release upload "${{ github.ref_name }}" release-apks/*.apk --clobber
