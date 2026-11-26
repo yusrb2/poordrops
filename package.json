@@ -19,6 +19,7 @@
     "@radix-ui/react-switch": "^1.4.1",
     "@radix-ui/react-tabs": "^1.2.1",
     "clsx": "^2.1.1",
+    "fflate": "^0.8.3",
     "jsqr": "^1.4.0",
     "lucide-preact": "^1.81.0",
     "preact": "^11.2.0",
