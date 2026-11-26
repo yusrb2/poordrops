@@ -1,31 +1,42 @@
-import type { Room } from 'trystero';
 import { computeSha256Hex } from './crypto';
-import { deviceName } from './identity';
 import {
-  getActiveActions,
+  deviceName,
+  localDeviceKind,
+  localOsBadge,
+} from './identity';
+import {
+  getAllActiveBundles,
   getPeerConnection,
+  getPeerRoomContext,
   registerP2PActionHook,
-  type P2PActions,
+  type OfferPayload,
+  type RoomBundle,
   type TransferMetaPayload,
 } from './p2p';
-import { playStamp } from './sound';
-import { peerList } from '../state/p2pState';
+import { playChime, playStamp } from './sound';
+import { peerList, peers } from '../state/p2pState';
 import {
   addManifestItem,
+  autoAcceptEnabled,
   autoCopyEnabled,
   autoCopyWarning,
   clipboardMeta,
   clipboardText,
+  enqueueIncomingOffer,
+  outgoingOfferStatus,
+  pendingOffer,
   removeActiveTransfer,
+  shiftIncomingOffer,
   updateManifestVerification,
   upsertActiveTransfer,
 } from '../state/transferState';
 
 export const CHUNK_SIZE = 64 * 1024; // 64KB chunks
-const BUFFERED_LOW_THRESHOLD = 64 * 1024; // 64KB
-const BUFFERED_HIGH_WATER = 512 * 1024; // 512KB backpressure ceiling
+const BUFFERED_LOW_THRESHOLD = 64 * 1024;
+const BUFFERED_HIGH_WATER = 512 * 1024;
 const BULK_CHANNEL_ID = 777;
-const HEADER_BYTES = 40; // 36-byte UUID + 4-byte uint32 chunk index
+const HEADER_BYTES = 40;
+const OFFER_TIMEOUT_MS = 45000;
 
 interface IncomingTransferBuffer {
   meta: TransferMetaPayload;
@@ -38,17 +49,23 @@ interface IncomingTransferBuffer {
   cancelled: boolean;
 }
 
+interface PendingOutgoingOfferResolver {
+  resolve: (accepted: boolean) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 const incomingMap = new Map<string, IncomingTransferBuffer>();
 const cancelledOutgoing = new Set<string>();
 const bulkChannels = new Map<string, RTCDataChannel>();
+const outgoingOfferResolvers = new Map<string, PendingOutgoingOfferResolver>();
+const hookedBundles = new WeakSet<RoomBundle>();
 let engineInitialized = false;
 
 function getPeerName(peerId: string): string {
-  const found = peerList.value.find((p) => p.id === peerId);
-  return found?.name || `Courier-${peerId.slice(0, 4)}`;
+  return peers.value[peerId]?.name || `Courier-${peerId.slice(0, 4)}`;
 }
 
-function makeTransferId(): string {
+function makeId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID();
   }
@@ -137,6 +154,20 @@ async function waitForBufferDrain(dc: RTCDataChannel): Promise<void> {
   });
 }
 
+function triggerAutoSave(objectUrl: string, fileName: string) {
+  try {
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = fileName;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } catch {
+    // non-fatal; manifest keeps the download button available
+  }
+}
+
 function handleIncomingChunk(transferId: string, chunkIndex: number, payload: Uint8Array) {
   const entry = incomingMap.get(transferId);
   if (!entry || entry.cancelled) return;
@@ -215,9 +246,11 @@ async function finalizeIncomingTransfer(transferId: string, speedMBps: number) {
     playStamp();
   }
 
-  const actions = getActiveActions();
-  if (actions) {
-    actions.ack
+  triggerAutoSave(objectUrl, entry.meta.name);
+
+  const ctx = getPeerRoomContext(entry.peerId);
+  if (ctx) {
+    ctx.bundle.actions.ack
       .send(
         {
           transferId,
@@ -231,8 +264,11 @@ async function finalizeIncomingTransfer(transferId: string, speedMBps: number) {
   }
 }
 
-function attachRoomTransferListeners(room: Room, actions: P2PActions) {
-  bulkChannels.clear();
+function attachRoomTransferListeners(bundle: RoomBundle) {
+  if (hookedBundles.has(bundle)) return;
+  hookedBundles.add(bundle);
+
+  const { room, actions } = bundle;
 
   room.onPeerJoin(
     ({ peerId }) => {
@@ -271,6 +307,38 @@ function attachRoomTransferListeners(room: Room, actions: P2PActions) {
         autoCopyWarning.value = 'blocked';
       }
     }
+  });
+
+  actions.offer.onMessage((offer, { peerId }) => {
+    if (!offer || !offer.offerId) return;
+    if (autoAcceptEnabled.value) {
+      actions.offerReply
+        .send({ offerId: offer.offerId, accepted: true }, { target: peerId })
+        .catch(() => {});
+      return;
+    }
+
+    playChime();
+    enqueueIncomingOffer({
+      offerId: offer.offerId,
+      peerId,
+      peerName: offer.senderName || getPeerName(peerId),
+      peerKind: offer.senderKind || 'desktop',
+      peerOs: offer.senderOs || 'Web',
+      files: offer.files || [],
+      totalSize: offer.totalSize || 0,
+      isZipBundle: offer.isZipBundle,
+      receivedAt: Date.now(),
+    });
+  });
+
+  actions.offerReply.onMessage((reply) => {
+    if (!reply?.offerId) return;
+    const pending = outgoingOfferResolvers.get(reply.offerId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    outgoingOfferResolvers.delete(reply.offerId);
+    pending.resolve(Boolean(reply.accepted));
   });
 
   actions.meta.onMessage((meta, { peerId }) => {
@@ -334,21 +402,59 @@ export function initTransferEngine() {
   registerP2PActionHook(attachRoomTransferListeners);
 }
 
+export function respondToPendingOffer(accepted: boolean) {
+  const current = pendingOffer.value;
+  if (!current) return;
+  shiftIncomingOffer();
+
+  const ctx = getPeerRoomContext(current.peerId);
+  if (ctx) {
+    ctx.bundle.actions.offerReply
+      .send({ offerId: current.offerId, accepted }, { target: current.peerId })
+      .catch(() => {});
+  }
+}
+
 export async function pushClipboardText(text: string) {
-  const actions = getActiveActions();
-  if (!actions || peerList.value.length === 0) return;
+  const bundles = getAllActiveBundles();
+  if (bundles.length === 0 || peerList.value.length === 0) return;
+
   clipboardMeta.value = {
     senderName: deviceName.value,
     receivedAt: Date.now(),
     isRemote: false,
   };
-  await actions.clip
-    .send({
-      id: makeTransferId(),
-      text,
-      senderName: deviceName.value,
-      sentAt: Date.now(),
-    })
+
+  const payload = {
+    id: makeId(),
+    text,
+    senderName: deviceName.value,
+    sentAt: Date.now(),
+  };
+
+  await Promise.all(
+    bundles.map((b) => b.actions.clip.send(payload).catch(() => {}))
+  );
+}
+
+export async function pushClipboardToPeer(peerId: string, text: string) {
+  const ctx = getPeerRoomContext(peerId);
+  if (!ctx || !text) return;
+  clipboardMeta.value = {
+    senderName: deviceName.value,
+    receivedAt: Date.now(),
+    isRemote: false,
+  };
+  await ctx.bundle.actions.clip
+    .send(
+      {
+        id: makeId(),
+        text,
+        senderName: deviceName.value,
+        sentAt: Date.now(),
+      },
+      { target: peerId }
+    )
     .catch(() => {});
 }
 
@@ -360,29 +466,114 @@ export function cancelTransfer(transferId: string) {
     incomingMap.delete(transferId);
   }
   removeActiveTransfer(transferId);
-  const actions = getActiveActions();
-  if (actions) {
-    actions.cancel.send({ transferId }).catch(() => {});
+  for (const b of getAllActiveBundles()) {
+    b.actions.cancel.send({ transferId }).catch(() => {});
   }
 }
 
-export async function sendFiles(
+async function requestOfferApproval(
+  peerId: string,
+  peerName: string,
   files: File[],
-  options?: { isZipBundle?: boolean }
+  isZipBundle: boolean
+): Promise<'accepted' | 'declined' | 'timeout'> {
+  const ctx = getPeerRoomContext(peerId);
+  if (!ctx) return 'declined';
+
+  const offerId = makeId();
+  const payload: OfferPayload = {
+    offerId,
+    senderName: deviceName.value,
+    senderKind: localDeviceKind,
+    senderOs: localOsBadge,
+    files: files.map((f) => ({
+      name: f.name,
+      size: f.size,
+      mime: f.type || 'application/octet-stream',
+    })),
+    totalSize: files.reduce((acc, f) => acc + f.size, 0),
+    isZipBundle,
+  };
+
+  outgoingOfferStatus.value = { peerName, state: 'waiting' };
+
+  const decision = await new Promise<'accepted' | 'declined' | 'timeout'>((resolve) => {
+    const timer = setTimeout(() => {
+      outgoingOfferResolvers.delete(offerId);
+      resolve('timeout');
+    }, OFFER_TIMEOUT_MS);
+
+    outgoingOfferResolvers.set(offerId, {
+      timer,
+      resolve: (accepted) => resolve(accepted ? 'accepted' : 'declined'),
+    });
+
+    ctx.bundle.actions.offer.send(payload, { target: peerId }).catch(() => {
+      clearTimeout(timer);
+      outgoingOfferResolvers.delete(offerId);
+      resolve('declined');
+    });
+  });
+
+  if (decision === 'accepted') {
+    outgoingOfferStatus.value = null;
+  } else {
+    outgoingOfferStatus.value = { peerName, state: decision };
+    setTimeout(() => {
+      if (outgoingOfferStatus.value?.peerName === peerName) {
+        outgoingOfferStatus.value = null;
+      }
+    }, 3200);
+  }
+
+  return decision;
+}
+
+export async function sendFilesToPeers(
+  files: File[],
+  options?: { targetPeerIds?: string[]; isZipBundle?: boolean }
 ): Promise<void> {
-  const actions = getActiveActions();
-  const targets = peerList.value;
-  if (!actions || targets.length === 0 || files.length === 0) return;
+  if (files.length === 0) return;
+
+  const candidateIds = options?.targetPeerIds?.length
+    ? options.targetPeerIds
+    : peerList.value.map((p) => p.id);
+
+  const uniqueTargets = Array.from(new Set(candidateIds)).filter((id) => Boolean(peers.value[id]));
+  if (uniqueTargets.length === 0) return;
+
+  // Ask each target peer for AirDrop-style acceptance first
+  const acceptedPeers: string[] = [];
+  await Promise.all(
+    uniqueTargets.map(async (peerId) => {
+      const peerName = getPeerName(peerId);
+      const decision = await requestOfferApproval(
+        peerId,
+        peerName,
+        files,
+        Boolean(options?.isZipBundle)
+      );
+      if (decision === 'accepted') {
+        acceptedPeers.push(peerId);
+      }
+    })
+  );
+
+  if (acceptedPeers.length === 0) return;
 
   for (const file of files) {
     const sha256 = await computeSha256Hex(file);
     const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
     const mime = file.type || 'application/octet-stream';
 
-    for (const target of targets) {
-      const transferId = makeTransferId();
+    for (const peerId of acceptedPeers) {
+      const ctx = getPeerRoomContext(peerId);
+      if (!ctx) continue;
+
+      const peerName = getPeerName(peerId);
+      const transferId = makeId();
       const startedAt = Date.now();
-      const dc = ensureBulkDataChannel(target.id);
+      const dc = ensureBulkDataChannel(peerId);
 
       const meta: TransferMetaPayload = {
         transferId,
@@ -402,10 +593,10 @@ export async function sendFiles(
         transferredBytes: 0,
         speedMBps: 0,
         etaSeconds: 0,
-        peerName: target.name,
+        peerName,
       });
 
-      await actions.meta.send(meta, { target: target.id });
+      await ctx.bundle.actions.meta.send(meta, { target: peerId });
 
       let sentBytes = 0;
       let aborted = false;
@@ -418,7 +609,8 @@ export async function sendFiles(
 
         const start = i * CHUNK_SIZE;
         const end = Math.min(file.size, start + CHUNK_SIZE);
-        const sliceBuf = file.size === 0 ? new ArrayBuffer(0) : await file.slice(start, end).arrayBuffer();
+        const sliceBuf =
+          file.size === 0 ? new ArrayBuffer(0) : await file.slice(start, end).arrayBuffer();
         const chunkBytes = new Uint8Array(sliceBuf);
 
         if (dc && dc.readyState === 'open') {
@@ -432,8 +624,8 @@ export async function sendFiles(
           sendCopy.set(frame);
           dc.send(sendCopy.buffer);
         } else {
-          await actions.chunk.send(chunkBytes, {
-            target: target.id,
+          await ctx.bundle.actions.chunk.send(chunkBytes, {
+            target: peerId,
             metadata: { t: transferId, i },
           });
         }
@@ -453,7 +645,7 @@ export async function sendFiles(
           transferredBytes: sentBytes,
           speedMBps,
           etaSeconds,
-          peerName: target.name,
+          peerName,
         });
       }
 
@@ -478,7 +670,7 @@ export async function sendFiles(
         verification: sha256 ? 'verified' : 'unverified',
         speedMBps: finalSpeedMBps,
         timestamp: Date.now(),
-        peerName: target.name,
+        peerName,
         objectUrl,
         isZipBundle: options?.isZipBundle,
       });
@@ -486,3 +678,5 @@ export async function sendFiles(
     }
   }
 }
+
+export const sendFiles = sendFilesToPeers;

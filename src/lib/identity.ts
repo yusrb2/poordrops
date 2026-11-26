@@ -3,6 +3,9 @@ import { signal } from '@preact/signals';
 const DEVICE_NAME_KEY = 'poordrops_device_name';
 const LAST_ROOM_KEY = 'poordrops_last_room';
 
+export type DeviceKind = 'mobile' | 'desktop';
+export type OsBadge = 'Android' | 'iOS' | 'Windows' | 'macOS' | 'Linux' | 'Web';
+
 const ADJECTIVES = [
   'Cardboard',
   'Bubblewrap',
@@ -38,6 +41,36 @@ export interface LastRoomInfo {
   peerName?: string;
   timestamp: number;
 }
+
+function detectDeviceProfile(): { kind: DeviceKind; os: OsBadge } {
+  if (typeof navigator === 'undefined') {
+    return { kind: 'desktop', os: 'Web' };
+  }
+  const ua = navigator.userAgent || '';
+  const platform = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform || navigator.platform || '';
+  const combined = `${ua} ${platform}`;
+
+  let os: OsBadge = 'Web';
+  if (/Android/i.test(combined)) os = 'Android';
+  else if (/iPhone|iPad|iPod/i.test(combined)) os = 'iOS';
+  else if (/Win/i.test(combined)) os = 'Windows';
+  else if (/Mac/i.test(combined)) os = 'macOS';
+  else if (/Linux/i.test(combined)) os = 'Linux';
+
+  const isMobile =
+    os === 'Android' ||
+    os === 'iOS' ||
+    /Mobi|Tablet/i.test(ua);
+
+  return {
+    kind: isMobile ? 'mobile' : 'desktop',
+    os,
+  };
+}
+
+const detected = detectDeviceProfile();
+export const localDeviceKind: DeviceKind = detected.kind;
+export const localOsBadge: OsBadge = detected.os;
 
 function randomInt(max: number): number {
   if (typeof crypto !== 'undefined' && crypto.getRandomValues) {

@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'preact/hooks';
 import { Header } from './components/Header';
 import { DeviceBadge } from './components/DeviceBadge';
+import { NearbyRadar } from './components/NearbyRadar';
 import { PairingDesk } from './components/PairingDesk';
 import { ClipboardSlip } from './components/ClipboardSlip';
 import { CargoDropzone } from './components/CargoDropzone';
 import { ParcelManifest } from './components/ParcelManifest';
+import { IncomingParcelModal } from './components/IncomingParcelModal';
 import {
   OnboardingModal,
   shouldAutoOpenOnboarding,
@@ -30,12 +32,14 @@ export function App() {
       />
 
       <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-5 space-y-5">
-        <PairingDesk />
+        <NearbyRadar />
 
         <div className="grid gap-5 lg:grid-cols-2">
-          <ClipboardSlip />
           <CargoDropzone />
+          <ClipboardSlip />
         </div>
+
+        <PairingDesk />
 
         <ParcelManifest />
       </main>
@@ -44,6 +48,7 @@ export function App() {
         <p>{t.footer.license}</p>
       </footer>
 
+      <IncomingParcelModal />
       <OnboardingModal open={helpOpen} onOpenChange={setHelpOpen} />
     </div>
   );

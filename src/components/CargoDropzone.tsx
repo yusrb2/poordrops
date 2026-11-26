@@ -13,38 +13,40 @@ import { cn } from '../lib/cn';
 import { formatBytes, formatEta } from '../lib/crypto';
 import { useT } from '../lib/i18n';
 import { playClick } from '../lib/sound';
-import { cancelTransfer, sendFiles } from '../lib/transfer';
+import { cancelTransfer, sendFilesToPeers } from '../lib/transfer';
 import { createZipBundle } from '../lib/zipBundle';
 import { isConnected } from '../state/p2pState';
-import { activeTransfers } from '../state/transferState';
+import {
+  activeTransfers,
+  addStagedFiles,
+  clearStagedFiles,
+  removeStagedFile,
+  sharedNotice,
+  stagedFiles,
+} from '../state/transferState';
 
 export function CargoDropzone() {
   const t = useT();
   const inputRef = useRef<HTMLInputElement>(null);
-  const [staged, setStaged] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
   const [bundling, setBundling] = useState(false);
 
   const connected = isConnected.value;
   const active = activeTransfers.value;
+  const staged = stagedFiles.value;
 
   function addFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
     playClick();
-    const incoming = Array.from(fileList);
-    setStaged((prev) => [...prev, ...incoming]);
-  }
-
-  function removeStaged(index: number) {
-    playClick();
-    setStaged((prev) => prev.filter((_, idx) => idx !== index));
+    addStagedFiles(Array.from(fileList));
   }
 
   async function handleSendRaw() {
     if (!connected || staged.length === 0) return;
     const batch = [...staged];
-    setStaged([]);
-    await sendFiles(batch);
+    clearStagedFiles();
+    sharedNotice.value = null;
+    await sendFilesToPeers(batch);
   }
 
   async function handleBundleZip() {
@@ -53,8 +55,9 @@ export function CargoDropzone() {
     try {
       const batch = [...staged];
       const zipFile = await createZipBundle(batch);
-      setStaged([]);
-      await sendFiles([zipFile], { isZipBundle: true });
+      clearStagedFiles();
+      sharedNotice.value = null;
+      await sendFilesToPeers([zipFile], { isZipBundle: true });
     } finally {
       setBundling(false);
     }
@@ -135,7 +138,8 @@ export function CargoDropzone() {
                 type="button"
                 onClick={() => {
                   playClick();
-                  setStaged([]);
+                  clearStagedFiles();
+                  sharedNotice.value = null;
                 }}
                 className="inline-flex items-center gap-1 hover:text-[var(--accent-airmail)] cursor-pointer"
               >
@@ -158,7 +162,10 @@ export function CargoDropzone() {
                     <button
                       type="button"
                       aria-label={`Remove ${f.name}`}
-                      onClick={() => removeStaged(idx)}
+                      onClick={() => {
+                        playClick();
+                        removeStagedFile(idx);
+                      }}
                       className="text-[var(--ink-secondary)] hover:text-[var(--accent-airmail)] cursor-pointer"
                     >
                       <X size={13} />

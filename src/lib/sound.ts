@@ -29,7 +29,9 @@ let audioCtx: AudioContext | null = null;
 function getCtx(): AudioContext | null {
   if (!soundEnabled.value) return null;
   if (typeof window === 'undefined') return null;
-  const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  const Ctx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
   if (!Ctx) return null;
   if (!audioCtx) {
     audioCtx = new Ctx();
@@ -99,6 +101,29 @@ export function playConnect() {
       gain.connect(ctx.destination);
       osc.start(t);
       osc.stop(t + 0.12);
+    });
+  } catch {
+    // non-fatal
+  }
+}
+
+export function playChime() {
+  try {
+    const ctx = getCtx();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    [587.33, 880].forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      const t = now + idx * 0.09;
+      osc.frequency.setValueAtTime(freq, t);
+      gain.gain.setValueAtTime(0.11, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.24);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.26);
     });
   } catch {
     // non-fatal

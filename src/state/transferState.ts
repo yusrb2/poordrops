@@ -1,13 +1,17 @@
-import { signal } from '@preact/signals';
+import { computed, signal } from '@preact/signals';
+import type { DeviceKind, OsBadge } from '../lib/identity';
 import { playShred } from '../lib/sound';
 
 const AUTOCOPY_KEY = 'poordrops_autocopy';
+const AUTOACCEPT_KEY = 'poordrops_auto_accept';
 
-function loadAutoCopy(): boolean {
+function loadBool(key: string, fallback: boolean): boolean {
   try {
-    return localStorage.getItem(AUTOCOPY_KEY) === '1';
+    const val = localStorage.getItem(key);
+    if (val === null) return fallback;
+    return val === '1';
   } catch {
-    return false;
+    return fallback;
   }
 }
 
@@ -45,10 +49,41 @@ export interface ManifestItem {
   isZipBundle?: boolean;
 }
 
+export interface OfferFileSummary {
+  name: string;
+  size: number;
+  mime: string;
+}
+
+export interface IncomingOffer {
+  offerId: string;
+  peerId: string;
+  peerName: string;
+  peerKind: DeviceKind;
+  peerOs: OsBadge;
+  files: OfferFileSummary[];
+  totalSize: number;
+  isZipBundle?: boolean;
+  receivedAt: number;
+}
+
+export interface OutgoingOfferStatus {
+  peerName: string;
+  state: 'waiting' | 'declined' | 'timeout';
+}
+
+export const stagedFiles = signal<File[]>([]);
+export const sharedNotice = signal<string | null>(null);
+
 export const clipboardText = signal<string>('');
 export const clipboardMeta = signal<ClipboardMeta | null>(null);
-export const autoCopyEnabled = signal<boolean>(loadAutoCopy());
+export const autoCopyEnabled = signal<boolean>(loadBool(AUTOCOPY_KEY, false));
 export const autoCopyWarning = signal<string | null>(null);
+
+export const autoAcceptEnabled = signal<boolean>(loadBool(AUTOACCEPT_KEY, false));
+export const pendingOffers = signal<IncomingOffer[]>([]);
+export const pendingOffer = computed(() => pendingOffers.value[0] ?? null);
+export const outgoingOfferStatus = signal<OutgoingOfferStatus | null>(null);
 
 export const activeTransfers = signal<ActiveTransfer[]>([]);
 export const manifestItems = signal<ManifestItem[]>([]);
@@ -61,6 +96,38 @@ export function setAutoCopy(next: boolean) {
   } catch {
     // ignore
   }
+}
+
+export function setAutoAccept(next: boolean) {
+  autoAcceptEnabled.value = next;
+  try {
+    localStorage.setItem(AUTOACCEPT_KEY, next ? '1' : '0');
+  } catch {
+    // ignore
+  }
+}
+
+export function addStagedFiles(files: File[]) {
+  if (files.length === 0) return;
+  stagedFiles.value = [...stagedFiles.value, ...files];
+}
+
+export function removeStagedFile(index: number) {
+  stagedFiles.value = stagedFiles.value.filter((_, idx) => idx !== index);
+}
+
+export function clearStagedFiles() {
+  stagedFiles.value = [];
+}
+
+export function enqueueIncomingOffer(offer: IncomingOffer) {
+  pendingOffers.value = [...pendingOffers.value, offer];
+}
+
+export function shiftIncomingOffer(): IncomingOffer | null {
+  const [first, ...rest] = pendingOffers.value;
+  pendingOffers.value = rest;
+  return first ?? null;
 }
 
 export function upsertActiveTransfer(item: ActiveTransfer) {
