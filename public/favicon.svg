@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <!-- Warm Kraft backing -->
+  <rect width="512" height="512" rx="96" fill="#F5EFE6" />
+
+  <!-- Physical card shadow -->
+  <rect x="64" y="76" width="388" height="376" rx="34" fill="#DDD2C0" />
+
+  <!-- Thermal receipt postal stamp card -->
+  <rect x="60" y="64" width="388" height="376" rx="34" fill="#FBF8F3" stroke="#CFC5B4" stroke-width="8" />
+
+  <!-- Perforated dashed stamp inner frame -->
+  <rect x="84" y="88" width="340" height="328" rx="22" stroke="#CFC5B4" stroke-width="5" stroke-dasharray="14 12" />
+
+  <!-- Subtle matcha customs postmark ring -->
+  <circle cx="352" cy="164" r="52" stroke="#3E6B48" stroke-width="5" stroke-dasharray="10 7" opacity="0.88" />
+  <circle cx="352" cy="164" r="36" stroke="#3E6B48" stroke-width="3" opacity="0.72" />
+  <path d="M312 164H392" stroke="#3E6B48" stroke-width="3" opacity="0.72" />
+
+  <!-- Terracotta vermilion airmail stamp block -->
+  <rect x="114" y="122" width="124" height="52" rx="8" fill="#C85A32" />
+  <path d="M132 148H220" stroke="#FBF8F3" stroke-width="7" stroke-linecap="round" />
+  <path d="M132 135H178" stroke="#FBF8F3" stroke-width="4" stroke-linecap="round" opacity="0.85" />
+  <path d="M132 161H198" stroke="#FBF8F3" stroke-width="4" stroke-linecap="round" opacity="0.85" />
+
+  <!-- Minimalist paper plane / transfer arrow in stamped charcoal ink -->
+  <path d="M132 308L374 204L296 368L244 304L132 308Z" fill="#EFE7DA" stroke="#24201C" stroke-width="14" stroke-linejoin="round" />
+  <path d="M374 204L244 304L238 358L276 322" stroke="#24201C" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" />
+
+  <!-- Small vermilion directional tail accent -->
+  <path d="M134 356L194 334" stroke="#C85A32" stroke-width="10" stroke-linecap="round" />
+  <path d="M150 380L202 360" stroke="#C85A32" stroke-width="8" stroke-linecap="round" opacity="0.8" />
+</svg>
