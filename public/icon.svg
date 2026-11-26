@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="72" fill="#F5EFE6" />
+  <rect x="36" y="36" width="440" height="440" rx="48" fill="#FBF8F3" stroke="#CFC5B4" stroke-width="10" stroke-dasharray="22 14" />
+  <path d="M120 176L256 106L392 176V340L256 410L120 340V176Z" fill="#EFE7DA" stroke="#24201C" stroke-width="16" stroke-linejoin="round" />
+  <path d="M120 176L256 246L392 176" stroke="#24201C" stroke-width="16" stroke-linejoin="round" />
+  <path d="M256 246V410" stroke="#24201C" stroke-width="16" stroke-linecap="round" />
+  <path d="M188 141L324 211" stroke="#C85A32" stroke-width="24" stroke-linecap="round" />
+  <rect x="282" y="286" width="136" height="56" rx="8" transform="rotate(-8 282 286)" fill="#FBF8F3" stroke="#3E6B48" stroke-width="10" />
+  <text x="350" y="324" transform="rotate(-8 282 286)" text-anchor="middle" font-family="monospace" font-size="26" font-weight="bold" fill="#3E6B48">P2P</text>
+</svg>
