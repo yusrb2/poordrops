@@ -14,6 +14,7 @@ export default defineConfig({
         'favicon.svg',
         'favicon-32x32.png',
         'apple-touch-icon.png',
+        'share-target-sw.js',
       ],
       manifest: {
         name: 'PoorDrops',
@@ -43,12 +44,29 @@ export default defineConfig({
             purpose: 'maskable',
           },
         ],
+        share_target: {
+          action: '/share-target',
+          method: 'POST',
+          enctype: 'multipart/form-data',
+          params: {
+            title: 'title',
+            text: 'text',
+            url: 'url',
+            files: [
+              {
+                name: 'files',
+                accept: ['*/*'],
+              },
+            ],
+          },
+        },
       },
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,webp,woff2}'],
         navigateFallback: 'index.html',
         cleanupOutdatedCaches: true,
         maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
+        importScripts: ['share-target-sw.js'],
       },
     }),
   ],

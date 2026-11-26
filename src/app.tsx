@@ -13,6 +13,7 @@ import {
 } from './components/OnboardingModal';
 import { useT } from './lib/i18n';
 import { broadcastAlias, initPairingFromUrl } from './lib/p2p';
+import { initShareTargetListener } from './lib/shareTarget';
 import { initTransferEngine } from './lib/transfer';
 
 export function App() {
@@ -22,6 +23,7 @@ export function App() {
   useEffect(() => {
     initTransferEngine();
     initPairingFromUrl();
+    initShareTargetListener();
   }, []);
 
   return (
