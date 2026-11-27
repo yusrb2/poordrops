@@ -5,14 +5,19 @@ export type ConnectionState = 'idle' | 'waiting' | 'connecting' | 'connected' | 
 export type NearbyScope = 'wifi' | 'lobby';
 export type NearbyStatus = 'scanning' | 'ready' | 'offline';
 export type SignalingState = 'connecting' | 'connected' | 'error';
+export type TransportMode = 'direct' | 'relay';
 
 export interface PeerMeta {
   id: string;
+  trysteroPeerId?: string;
   name: string;
   kind: DeviceKind;
   os: OsBadge;
   ready: boolean;
   source: 'nearby' | 'pin';
+  transportMode: TransportMode;
+  relayReady: boolean;
+  discoveredAt: number;
   joinedAt: number;
   lastSeen: number;
 }

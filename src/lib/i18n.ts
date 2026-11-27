@@ -72,7 +72,9 @@ export const dict = {
       diagRoom: 'Room',
       diagSignal: 'Signal',
       diagIce: 'ICE',
-      diagErrorHint: 'Connection hiccup detected. Retry to re-establish WebRTC/TURN.',
+      badgeDirect: 'Direct LAN',
+      badgeRelay: 'Relay Active',
+      relayLargeFileHint: 'File > 25MB on Relay Active mode — streaming cleanly in 16KB encrypted chunks.',
     },
     incoming: {
       title: 'Incoming AirDrop Parcel',
@@ -231,7 +233,9 @@ export const dict = {
       diagRoom: 'Ruang',
       diagSignal: 'Sinyal',
       diagIce: 'ICE',
-      diagErrorHint: 'Gangguan koneksi terdeteksi. Coba sambung ulang untuk negosiasi WebRTC/TURN.',
+      badgeDirect: 'Direct LAN',
+      badgeRelay: 'Relay Active',
+      relayLargeFileHint: 'File > 25MB pada mode Relay Active — dikirim stabil dengan potongan terenkripsi 16KB.',
     },
     incoming: {
       title: 'Paket AirDrop Masuk',

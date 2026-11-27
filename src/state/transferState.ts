@@ -74,6 +74,7 @@ export interface OutgoingOfferStatus {
 
 export const stagedFiles = signal<File[]>([]);
 export const sharedNotice = signal<string | null>(null);
+export const relaySizeNotice = signal<string | null>(null);
 
 export const clipboardText = signal<string>('');
 export const clipboardMeta = signal<ClipboardMeta | null>(null);

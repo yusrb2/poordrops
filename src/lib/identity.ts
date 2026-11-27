@@ -47,7 +47,10 @@ function detectDeviceProfile(): { kind: DeviceKind; os: OsBadge } {
     return { kind: 'desktop', os: 'Web' };
   }
   const ua = navigator.userAgent || '';
-  const platform = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform || navigator.platform || '';
+  const platform =
+    (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ||
+    navigator.platform ||
+    '';
   const combined = `${ua} ${platform}`;
 
   let os: OsBadge = 'Web';
@@ -57,10 +60,7 @@ function detectDeviceProfile(): { kind: DeviceKind; os: OsBadge } {
   else if (/Mac/i.test(combined)) os = 'macOS';
   else if (/Linux/i.test(combined)) os = 'Linux';
 
-  const isMobile =
-    os === 'Android' ||
-    os === 'iOS' ||
-    /Mobi|Tablet/i.test(ua);
+  const isMobile = os === 'Android' || os === 'iOS' || /Mobi|Tablet/i.test(ua);
 
   return {
     kind: isMobile ? 'mobile' : 'desktop',
@@ -68,9 +68,19 @@ function detectDeviceProfile(): { kind: DeviceKind; os: OsBadge } {
   };
 }
 
+function makeClientId(): string {
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const bytes = new Uint8Array(6);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return Math.random().toString(16).slice(2, 14).padEnd(12, '0');
+}
+
 const detected = detectDeviceProfile();
 export const localDeviceKind: DeviceKind = detected.kind;
 export const localOsBadge: OsBadge = detected.os;
+export const localClientId: string = makeClientId();
 
 function randomInt(max: number): number {
   if (typeof crypto !== 'undefined' && crypto.getRandomValues) {

@@ -9,12 +9,18 @@ import { computeSha256Hex } from './crypto';
 import {
   deviceName,
   generatePin,
+  localClientId,
   localDeviceKind,
   localOsBadge,
   saveLastRoom,
   type DeviceKind,
   type OsBadge,
 } from './identity';
+import {
+  createRelayTunnel,
+  type RelayEnvelope,
+  type RelayTunnel,
+} from './relayTunnel';
 import { playConnect } from './sound';
 import {
   connectionState,
@@ -28,14 +34,17 @@ import {
   nearbyScope,
   nearbyStatus,
   p2pError,
+  peers,
   pinPeers,
   selfPeerId,
   signalingBrokerCount,
   signalingState,
   type PeerMeta,
+  type TransportMode,
 } from '../state/p2pState';
 
 export interface HelloPayload {
+  clientId: string;
   peerId: string;
   name: string;
   kind: DeviceKind;
@@ -108,11 +117,14 @@ export interface P2PActions {
 
 export interface RoomBundle {
   source: 'nearby' | 'pin';
+  roomId: string;
   room: Room;
   actions: P2PActions;
+  relay: RelayTunnel;
 }
 
 type RoomHook = (bundle: RoomBundle) => void;
+type RelayHandler = (bundle: RoomBundle, envelope: RelayEnvelope) => void;
 
 const APP_ID = 'poordrops-p2p-v1';
 const MQTT_BROKERS = [
@@ -123,25 +135,33 @@ const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
     {
       urls: [
         'turn:openrelay.metered.ca:80',
         'turn:openrelay.metered.ca:443',
         'turn:openrelay.metered.ca:443?transport=tcp',
+        'turn:a.relay.metered.ca:80',
+        'turn:a.relay.metered.ca:443',
+        'turn:a.relay.metered.ca:443?transport=tcp',
       ],
       username: 'openrelayproject',
       credential: 'openrelayproject',
     },
   ],
-  iceCandidatePoolSize: 6,
+  iceTransportPolicy: 'all',
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require',
+  iceCandidatePoolSize: 8,
 };
 
 const IPV4_REGEX =
   /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 const HEARTBEAT_MS = 2000;
-const STALE_PEER_MS = 7000;
-const GRACE_OFFLINE_MS = 5500;
+const STALE_PEER_MS = 10000;
+const RELAY_FALLBACK_MS = 4500;
+const GRACE_OFFLINE_MS = 6000;
 
 let nearbyBundle: RoomBundle | null = null;
 let nearbyGeneration = 0;
@@ -150,10 +170,18 @@ let pinBundle: RoomBundle | null = null;
 let pinGeneration = 0;
 let nearbyHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let actionHook: RoomHook | null = null;
+let relayMessageHook: RelayHandler | null = null;
 let lifecycleRegistered = false;
 let lastWakeActionAt = 0;
+let pruneSuspendedUntil = 0;
 
 const monitoredPcs = new WeakSet<RTCPeerConnection>();
+const trysteroIdToClient = new Map<string, string>();
+const pendingRelayPings = new Map<string, (ms: number | null) => void>();
+
+export function resolveClientId(trysteroPeerId: string): string {
+  return trysteroIdToClient.get(trysteroPeerId) ?? trysteroPeerId;
+}
 
 function attachIceMonitor(pc: RTCPeerConnection | null | undefined) {
   if (!pc) return;
@@ -162,12 +190,7 @@ function attachIceMonitor(pc: RTCPeerConnection | null | undefined) {
   monitoredPcs.add(pc);
   pc.addEventListener('iceconnectionstatechange', () => {
     iceState.value = pc.iceConnectionState;
-    if (pc.iceConnectionState === 'failed') {
-      lastError.value = 'ICE negotiation failed (check firewall or retry TURN).';
-    } else if (
-      pc.iceConnectionState === 'connected' ||
-      pc.iceConnectionState === 'completed'
-    ) {
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
       lastError.value = null;
     }
   });
@@ -202,7 +225,8 @@ function buildActions(room: Room): P2PActions {
 
 function makeHelloPayload(): HelloPayload {
   return {
-    peerId: selfPeerId.value,
+    clientId: localClientId,
+    peerId: selfPeerId.value || localClientId,
     name: deviceName.value,
     kind: localDeviceKind,
     deviceType: localDeviceKind,
@@ -213,24 +237,34 @@ function makeHelloPayload(): HelloPayload {
 }
 
 function countOpenRelaySockets(): number {
+  let open = 0;
   try {
     const sockets = getRelaySockets();
-    let open = 0;
     for (const ws of Object.values(sockets)) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         open += 1;
       }
     }
-    return open;
   } catch {
-    return 0;
+    // ignore
   }
+  if (nearbyBundle) {
+    open = Math.max(open, nearbyBundle.relay.openCount());
+  }
+  if (pinBundle) {
+    open = Math.max(open, pinBundle.relay.openCount());
+  }
+  return open;
 }
 
 export function registerP2PActionHook(hook: RoomHook) {
   actionHook = hook;
   if (nearbyBundle) hook(nearbyBundle);
   if (pinBundle) hook(pinBundle);
+}
+
+export function registerRelayMessageHandler(handler: RelayHandler) {
+  relayMessageHook = handler;
 }
 
 export function getAllActiveBundles(): RoomBundle[] {
@@ -240,41 +274,85 @@ export function getAllActiveBundles(): RoomBundle[] {
   return list;
 }
 
-export function getPeerRoomContext(peerId: string): {
+export function getPeerTransportContext(clientId: string): {
   bundle: RoomBundle;
+  peerMeta: PeerMeta;
+  trysteroPeerId?: string;
   connection: RTCPeerConnection | null;
+  mode: TransportMode;
 } | null {
-  if (pinBundle) {
-    const info = pinBundle.room.getPeers()[peerId];
-    if (info) {
-      return { bundle: pinBundle, connection: info.connection ?? null };
-    }
+  const pinMeta = pinPeers.value[clientId];
+  if (pinMeta && pinBundle) {
+    const tId = pinMeta.trysteroPeerId;
+    const conn = tId ? pinBundle.room.getPeers()[tId]?.connection ?? null : null;
+    const directLive = Boolean(tId && pinBundle.room.getPeers()[tId]);
+    return {
+      bundle: pinBundle,
+      peerMeta: pinMeta,
+      trysteroPeerId: directLive ? tId : undefined,
+      connection: conn,
+      mode: directLive && pinMeta.transportMode === 'direct' ? 'direct' : 'relay',
+    };
   }
-  if (nearbyBundle) {
-    const info = nearbyBundle.room.getPeers()[peerId];
-    if (info) {
-      return { bundle: nearbyBundle, connection: info.connection ?? null };
-    }
+
+  const nearMeta = nearbyPeers.value[clientId];
+  if (nearMeta && nearbyBundle) {
+    const tId = nearMeta.trysteroPeerId;
+    const conn = tId ? nearbyBundle.room.getPeers()[tId]?.connection ?? null : null;
+    const directLive = Boolean(tId && nearbyBundle.room.getPeers()[tId]);
+    return {
+      bundle: nearbyBundle,
+      peerMeta: nearMeta,
+      trysteroPeerId: directLive ? tId : undefined,
+      connection: conn,
+      mode: directLive && nearMeta.transportMode === 'direct' ? 'direct' : 'relay',
+    };
   }
+
   return null;
 }
 
-export function getPeerConnection(peerId: string): RTCPeerConnection | null {
-  return getPeerRoomContext(peerId)?.connection ?? null;
+export function getPeerConnection(clientId: string): RTCPeerConnection | null {
+  return getPeerTransportContext(clientId)?.connection ?? null;
 }
 
-export async function pingPeer(peerId: string): Promise<number | null> {
-  const ctx = getPeerRoomContext(peerId);
+export async function pingPeer(clientId: string): Promise<number | null> {
+  const ctx = getPeerTransportContext(clientId);
   if (!ctx) return null;
-  try {
-    const ms = await Promise.race<number | null>([
-      ctx.bundle.room.ping(peerId).then((r) => Math.max(1, Math.round(r))),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
-    ]);
-    return ms;
-  } catch {
-    return null;
+
+  if (ctx.mode === 'direct' && ctx.trysteroPeerId) {
+    try {
+      const ms = await Promise.race<number | null>([
+        ctx.bundle.room.ping(ctx.trysteroPeerId).then((r) => Math.max(1, Math.round(r))),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500)),
+      ]);
+      if (ms !== null) return ms;
+    } catch {
+      // fall through to relay ping
+    }
   }
+
+  const pingId = `${localClientId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const startedAt = performance.now();
+  return new Promise<number | null>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingRelayPings.delete(pingId);
+      resolve(null);
+    }, 4500);
+
+    pendingRelayPings.set(pingId, (ms) => {
+      clearTimeout(timer);
+      resolve(ms);
+    });
+
+    ctx.bundle.relay
+      .send('ping', { id: pingId, sentAt: startedAt }, clientId)
+      .catch(() => {
+        clearTimeout(timer);
+        pendingRelayPings.delete(pingId);
+        resolve(null);
+      });
+  });
 }
 
 export function buildShareUrl(pin: string): string {
@@ -284,6 +362,15 @@ export function buildShareUrl(pin: string): string {
   return url.toString();
 }
 
+function sendBeaconToBundle(bundle: RoomBundle | null, targetTrysteroId?: string) {
+  if (!bundle) return;
+  const payload = makeHelloPayload();
+  bundle.actions.hello
+    .send(payload, targetTrysteroId ? { target: targetTrysteroId } : undefined)
+    .catch(() => {});
+  bundle.relay.send('hello', payload).catch(() => {});
+}
+
 export function broadcastAlias(name?: string) {
   const payload: HelloPayload = {
     ...makeHelloPayload(),
@@ -291,54 +378,77 @@ export function broadcastAlias(name?: string) {
   };
   if (nearbyBundle) {
     nearbyBundle.actions.hello.send(payload).catch(() => {});
+    nearbyBundle.relay.send('hello', payload).catch(() => {});
   }
   if (pinBundle) {
     pinBundle.actions.hello.send(payload).catch(() => {});
+    pinBundle.relay.send('hello', payload).catch(() => {});
   }
 }
 
 function updatePeerRecord(
   source: 'nearby' | 'pin',
-  peerId: string,
+  clientId: string,
   patch: Partial<PeerMeta>
 ) {
   const targetSignal = source === 'nearby' ? nearbyPeers : pinPeers;
   const current = targetSignal.value;
-  const existing = current[peerId];
+  const existing = current[clientId];
   const now = Date.now();
+  const isNew = !existing;
   const nextRecord: PeerMeta = {
-    id: peerId,
-    name: patch.name || existing?.name || `Courier-${peerId.slice(0, 4)}`,
+    id: clientId,
+    trysteroPeerId: patch.trysteroPeerId ?? existing?.trysteroPeerId,
+    name: patch.name || existing?.name || `Courier-${clientId.slice(0, 4)}`,
     kind: patch.kind || existing?.kind || 'desktop',
     os: patch.os || existing?.os || 'Web',
     ready: patch.ready ?? existing?.ready ?? true,
     source,
+    transportMode: patch.transportMode ?? existing?.transportMode ?? 'relay',
+    relayReady:
+      patch.relayReady ??
+      existing?.relayReady ??
+      (now - (existing?.discoveredAt ?? now) >= RELAY_FALLBACK_MS),
+    discoveredAt: existing?.discoveredAt ?? now,
     joinedAt: existing?.joinedAt ?? now,
     lastSeen: now,
   };
   targetSignal.value = {
     ...current,
-    [peerId]: nextRecord,
+    [clientId]: nextRecord,
   };
+  if (isNew) {
+    playConnect();
+  }
 }
 
-function removePeerRecord(source: 'nearby' | 'pin', peerId: string) {
+function removePeerRecord(source: 'nearby' | 'pin', clientId: string) {
   const targetSignal = source === 'nearby' ? nearbyPeers : pinPeers;
-  if (!targetSignal.value[peerId]) return;
+  if (!targetSignal.value[clientId]) return;
   const next = { ...targetSignal.value };
-  delete next[peerId];
+  delete next[clientId];
   targetSignal.value = next;
 }
 
 function pruneStaleNearbyPeers() {
   const now = Date.now();
+  if (now < pruneSuspendedUntil) return;
+
   const current = nearbyPeers.value;
   let changed = false;
   const next: Record<string, PeerMeta> = {};
 
   for (const [id, peer] of Object.entries(current)) {
-    if (now - peer.lastSeen <= STALE_PEER_MS) {
-      next[id] = peer;
+    const activeDirect = Boolean(
+      peer.trysteroPeerId && nearbyBundle?.room.getPeers()[peer.trysteroPeerId]
+    );
+    if (activeDirect || now - peer.lastSeen <= STALE_PEER_MS) {
+      if (!activeDirect && peer.transportMode === 'relay' && !peer.relayReady && now - peer.discoveredAt >= RELAY_FALLBACK_MS) {
+        next[id] = { ...peer, relayReady: true };
+        changed = true;
+      } else {
+        next[id] = peer;
+      }
     } else {
       changed = true;
     }
@@ -375,7 +485,6 @@ export async function getLocalRadarRoomId(): Promise<{
   displayLobbyId: string;
   scope: 'wifi' | 'lobby';
 }> {
-  // Primary: Cloudflare 1.1.1.1 IPv4 trace (fast, edge-cached, identical across mobile & desktop on same router)
   const ip =
     (await fetchIpv4WithTimeout('https://1.1.1.1/cdn-cgi/trace', async (res) => {
       const text = await res.text();
@@ -425,6 +534,60 @@ export async function getLocalRadarRoomId(): Promise<{
   };
 }
 
+function handleRelayEnvelope(bundle: RoomBundle, envelope: RelayEnvelope) {
+  if (envelope.type === 'hello') {
+    const p = envelope.payload as Partial<HelloPayload> | null;
+    if (!p) return;
+    const cid = p.clientId || envelope.from;
+    const targetMap = bundle.source === 'nearby' ? nearbyPeers.value : pinPeers.value;
+    const existing = targetMap[cid];
+    const directAlive = Boolean(
+      existing?.trysteroPeerId && bundle.room.getPeers()[existing.trysteroPeerId]
+    );
+    updatePeerRecord(bundle.source, cid, {
+      name: (p.name || '').trim() || undefined,
+      kind: p.deviceType || p.kind,
+      os: p.os,
+      ready: p.ready,
+      transportMode: directAlive ? 'direct' : 'relay',
+    });
+    if (bundle.source === 'nearby') {
+      nearbyStatus.value = 'ready';
+      signalingState.value = 'connected';
+      isRescanning.value = false;
+    } else {
+      connectionState.value = 'connected';
+    }
+    return;
+  }
+
+  if (envelope.type === 'ping') {
+    const p = envelope.payload as { id?: string; sentAt?: number } | null;
+    if (p?.id) {
+      bundle.relay.send('pong', { id: p.id, sentAt: p.sentAt }, envelope.from).catch(() => {});
+    }
+    return;
+  }
+
+  if (envelope.type === 'pong') {
+    const p = envelope.payload as { id?: string; sentAt?: number } | null;
+    if (p?.id) {
+      const resolver = pendingRelayPings.get(p.id);
+      if (resolver) {
+        pendingRelayPings.delete(p.id);
+        const elapsed =
+          typeof p.sentAt === 'number'
+            ? Math.max(1, Math.round(performance.now() - p.sentAt))
+            : 1;
+        resolver(elapsed);
+      }
+    }
+    return;
+  }
+
+  relayMessageHook?.(bundle, envelope);
+}
+
 async function teardownNearbyRoom() {
   nearbyGeneration += 1;
   if (nearbyHeartbeatTimer) {
@@ -435,6 +598,7 @@ async function teardownNearbyRoom() {
   nearbyBundle = null;
   nearbyPeers.value = {};
   if (prev) {
+    prev.relay.close();
     try {
       await prev.room.leave();
     } catch {
@@ -475,13 +639,35 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
       roomId
     );
 
+    const actions = buildActions(room);
+    const bundle: RoomBundle = {
+      source: 'nearby',
+      roomId,
+      room,
+      actions,
+      relay: await createRelayTunnel(
+        roomId,
+        (env) => {
+          if (gen === nearbyGeneration) handleRelayEnvelope(bundle, env);
+        },
+        (openBrokers) => {
+          if (gen !== nearbyGeneration) return;
+          if (openBrokers > 0) {
+            nearbyStatus.value = 'ready';
+            signalingState.value = 'connected';
+            isRescanning.value = false;
+            bundle.relay.send('hello', makeHelloPayload()).catch(() => {});
+          }
+        }
+      ),
+    };
+
     if (gen !== nearbyGeneration) {
+      bundle.relay.close();
       room.leave().catch(() => {});
       return;
     }
 
-    const actions = buildActions(room);
-    const bundle: RoomBundle = { source: 'nearby', room, actions };
     nearbyBundle = bundle;
 
     room.getSelf().then((self) => {
@@ -497,57 +683,70 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
         signalingState.value = 'connected';
         isRescanning.value = false;
         signalingBrokerCount.value = countOpenRelaySockets();
-        actions.hello.send(makeHelloPayload()).catch(() => {});
+        sendBeaconToBundle(bundle);
       })
-      .catch((err) => {
-        if (gen === nearbyGeneration) {
+      .catch(() => {
+        if (gen === nearbyGeneration && bundle.relay.isConnected()) {
+          nearbyStatus.value = 'ready';
+          signalingState.value = 'connected';
           isRescanning.value = false;
-          signalingState.value = 'error';
-          lastError.value = err instanceof Error ? err.message : 'Signaling ready failed.';
         }
       });
 
     actions.hello.onMessage((payload, { peerId }) => {
       if (gen !== nearbyGeneration || !payload) return;
-      updatePeerRecord('nearby', peerId, {
+      const cid = payload.clientId || peerId;
+      trysteroIdToClient.set(peerId, cid);
+      updatePeerRecord('nearby', cid, {
+        trysteroPeerId: peerId,
         name: (payload.name || '').trim() || undefined,
         kind: payload.deviceType || payload.kind,
         os: payload.os,
         ready: payload.ready,
+        transportMode: 'direct',
+        relayReady: true,
       });
       nearbyStatus.value = 'ready';
       signalingState.value = 'connected';
+      scanRoomConnections(room);
     });
 
     room.onPeerJoin(({ peerId }) => {
       if (gen !== nearbyGeneration) return;
-      const wasEmpty = Object.keys(nearbyPeers.value).length === 0;
-      updatePeerRecord('nearby', peerId, {});
       nearbyStatus.value = 'ready';
       signalingState.value = 'connected';
       isRescanning.value = false;
       lastError.value = null;
       scanRoomConnections(room);
-      if (wasEmpty) playConnect();
-      actions.hello.send(makeHelloPayload(), { target: peerId }).catch(() => {});
+      sendBeaconToBundle(bundle, peerId);
     });
 
     room.onPeerLeave(({ peerId }) => {
       if (gen !== nearbyGeneration) return;
-      removePeerRecord('nearby', peerId);
+      const cid = trysteroIdToClient.get(peerId);
+      trysteroIdToClient.delete(peerId);
+      if (cid && nearbyPeers.value[cid]) {
+        // Keep peer alive on Relay Active if relay is still connected
+        if (bundle.relay.isConnected()) {
+          updatePeerRecord('nearby', cid, {
+            trysteroPeerId: undefined,
+            transportMode: 'relay',
+            relayReady: true,
+          });
+        } else {
+          removePeerRecord('nearby', cid);
+        }
+      }
     });
 
     room.onError((err) => {
       if (gen !== nearbyGeneration) return;
       lastError.value = err.message || err.code;
-      if (err.code === 'relay-failed') {
+      if (err.code === 'peer-connect-failed') {
+        // Symmetric NAT blocked direct WebRTC; peers seamlessly stay on Relay Active
+        iceState.value = 'disconnected';
+      } else if (err.code === 'relay-failed' && !bundle.relay.isConnected()) {
         signalingState.value = 'error';
-        if (Object.keys(nearbyPeers.value).length === 0) {
-          nearbyStatus.value = 'offline';
-          isRescanning.value = false;
-        }
-      } else if (err.code === 'peer-connect-failed') {
-        iceState.value = 'failed';
       }
     });
 
@@ -565,19 +764,16 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         nearbyStatus.value = 'offline';
         signalingState.value = 'error';
-      } else if (openCount > 0 || Object.keys(nearbyPeers.value).length > 0) {
+      } else if (openCount > 0 || Object.keys(peers.value).length > 0) {
         nearbyStatus.value = 'ready';
         signalingState.value = 'connected';
       } else if (Date.now() - nearbyStartedAt > GRACE_OFFLINE_MS) {
         nearbyStatus.value = 'offline';
         signalingState.value = 'error';
-        if (!lastError.value) {
-          lastError.value = 'Unable to reach MQTT signaling brokers.';
-        }
       }
 
-      if (openCount > 0 || Object.keys(nearbyPeers.value).length > 0) {
-        nearbyBundle.actions.hello.send(makeHelloPayload()).catch(() => {});
+      if (openCount > 0) {
+        sendBeaconToBundle(nearbyBundle);
       }
     }, HEARTBEAT_MS);
 
@@ -607,7 +803,7 @@ export async function rescanNearbyDiscovery(options?: { forceReconnect?: boolean
   try {
     await initNearbyDiscovery({ force: true });
     if (pinBundle) {
-      pinBundle.actions.hello.send(makeHelloPayload()).catch(() => {});
+      sendBeaconToBundle(pinBundle);
     }
   } finally {
     setTimeout(() => {
@@ -618,22 +814,16 @@ export async function rescanNearbyDiscovery(options?: { forceReconnect?: boolean
 
 function handleWakeResume() {
   const now = Date.now();
-  if (now - lastWakeActionAt < 1200) return;
+  pruneSuspendedUntil = now + 6000;
+  if (now - lastWakeActionAt < 900) return;
   lastWakeActionAt = now;
 
   const openCount = countOpenRelaySockets();
-  if (
-    !nearbyBundle ||
-    openCount === 0 ||
-    nearbyStatus.value === 'offline' ||
-    signalingState.value === 'error'
-  ) {
+  if (!nearbyBundle || (openCount === 0 && !nearbyBundle.relay.isConnected())) {
     rescanNearbyDiscovery({ forceReconnect: true });
   } else {
-    nearbyBundle.actions.hello.send(makeHelloPayload()).catch(() => {});
-    if (pinBundle) {
-      pinBundle.actions.hello.send(makeHelloPayload()).catch(() => {});
-    }
+    sendBeaconToBundle(nearbyBundle);
+    sendBeaconToBundle(pinBundle);
   }
 }
 
@@ -641,10 +831,17 @@ export function registerLifecycleListeners() {
   if (lifecycleRegistered || typeof window === 'undefined') return;
   lifecycleRegistered = true;
 
+  // Never call room.leave() on visibilitychange/pagehide (Android file picker triggers temporary backgrounding)
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
+    if (document.visibilityState === 'hidden') {
+      pruneSuspendedUntil = Date.now() + 20000;
+    } else if (document.visibilityState === 'visible') {
       handleWakeResume();
     }
+  });
+
+  window.addEventListener('pagehide', () => {
+    pruneSuspendedUntil = Date.now() + 20000;
   });
 
   window.addEventListener('online', () => {
@@ -655,12 +852,13 @@ export function registerLifecycleListeners() {
     nearbyStatus.value = 'offline';
     signalingState.value = 'error';
     signalingBrokerCount.value = 0;
-    lastError.value = 'Network connection lost.';
   });
 
   try {
     CapApp.addListener('appStateChange', ({ isActive }) => {
-      if (isActive) {
+      if (!isActive) {
+        pruneSuspendedUntil = Date.now() + 20000;
+      } else {
         handleWakeResume();
       }
     }).catch(() => {});
@@ -680,6 +878,7 @@ export async function leaveRoom() {
   p2pError.value = null;
   connectionState.value = 'idle';
   if (prev) {
+    prev.relay.close();
     try {
       await prev.room.leave();
     } catch {
@@ -694,6 +893,7 @@ export async function joinPin(pin: string) {
 
   await leaveRoom();
   const gen = ++pinGeneration;
+  const roomId = `poordrops-v1-${cleanPin}`;
 
   currentPin.value = cleanPin;
   connectionState.value = 'connecting';
@@ -709,16 +909,35 @@ export async function joinPin(pin: string) {
         rtcConfig: RTC_CONFIG,
         trickleIce: true,
       },
-      `poordrops-v1-${cleanPin}`
+      roomId
     );
 
+    const actions = buildActions(room);
+    const bundle: RoomBundle = {
+      source: 'pin',
+      roomId,
+      room,
+      actions,
+      relay: await createRelayTunnel(
+        roomId,
+        (env) => {
+          if (gen === pinGeneration) handleRelayEnvelope(bundle, env);
+        },
+        (openBrokers) => {
+          if (gen !== pinGeneration) return;
+          if (openBrokers > 0) {
+            bundle.relay.send('hello', makeHelloPayload()).catch(() => {});
+          }
+        }
+      ),
+    };
+
     if (gen !== pinGeneration) {
+      bundle.relay.close();
       room.leave().catch(() => {});
       return;
     }
 
-    const actions = buildActions(room);
-    const bundle: RoomBundle = { source: 'pin', room, actions };
     pinBundle = bundle;
 
     room.getSelf().then((self) => {
@@ -731,35 +950,51 @@ export async function joinPin(pin: string) {
       if (gen === pinGeneration && Object.keys(pinPeers.value).length === 0) {
         connectionState.value = 'waiting';
       }
+      sendBeaconToBundle(bundle);
     }).catch(() => {});
 
     actions.hello.onMessage((payload, { peerId }) => {
       if (gen !== pinGeneration || !payload) return;
-      const nextName = (payload.name || '').trim() || `Courier-${peerId.slice(0, 4)}`;
-      updatePeerRecord('pin', peerId, {
+      const cid = payload.clientId || peerId;
+      trysteroIdToClient.set(peerId, cid);
+      const nextName = (payload.name || '').trim() || `Courier-${cid.slice(0, 4)}`;
+      updatePeerRecord('pin', cid, {
+        trysteroPeerId: peerId,
         name: nextName,
         kind: payload.deviceType || payload.kind,
         os: payload.os,
         ready: payload.ready,
+        transportMode: 'direct',
+        relayReady: true,
       });
+      connectionState.value = 'connected';
       saveLastRoom(cleanPin, nextName);
+      scanRoomConnections(room);
     });
 
     room.onPeerJoin(({ peerId }) => {
       if (gen !== pinGeneration) return;
-      const firstConnect = Object.keys(pinPeers.value).length === 0;
-      updatePeerRecord('pin', peerId, {});
       connectionState.value = 'connected';
       lastError.value = null;
       scanRoomConnections(room);
-      saveLastRoom(cleanPin, pinPeers.value[peerId]?.name);
-      if (firstConnect) playConnect();
-      actions.hello.send(makeHelloPayload(), { target: peerId }).catch(() => {});
+      sendBeaconToBundle(bundle, peerId);
     });
 
     room.onPeerLeave(({ peerId }) => {
       if (gen !== pinGeneration) return;
-      removePeerRecord('pin', peerId);
+      const cid = trysteroIdToClient.get(peerId);
+      trysteroIdToClient.delete(peerId);
+      if (cid && pinPeers.value[cid]) {
+        if (bundle.relay.isConnected()) {
+          updatePeerRecord('pin', cid, {
+            trysteroPeerId: undefined,
+            transportMode: 'relay',
+            relayReady: true,
+          });
+        } else {
+          removePeerRecord('pin', cid);
+        }
+      }
       if (Object.keys(pinPeers.value).length === 0) {
         connectionState.value = 'waiting';
       }
@@ -769,12 +1004,12 @@ export async function joinPin(pin: string) {
       if (gen !== pinGeneration) return;
       p2pError.value = err.message;
       lastError.value = err.message || err.code;
-      if (err.code === 'relay-failed') {
+      if (err.code === 'peer-connect-failed') {
+        iceState.value = 'disconnected';
+      } else if (err.code === 'relay-failed' && !bundle.relay.isConnected()) {
         if (Object.keys(pinPeers.value).length === 0) {
           connectionState.value = 'error';
         }
-      } else if (err.code === 'peer-connect-failed') {
-        iceState.value = 'failed';
       }
     });
 

@@ -1,8 +1,8 @@
 import { useRef, useState } from 'preact/hooks';
 import {
   Activity,
-  AlertTriangle,
   Clipboard,
+  Info,
   Laptop,
   Radio,
   RefreshCw,
@@ -28,7 +28,6 @@ import { pushClipboardToPeer, sendFilesToPeers } from '../lib/transfer';
 import {
   iceState,
   isRescanning,
-  lastError,
   lobbyId,
   nearbyScope,
   nearbyStatus,
@@ -41,6 +40,7 @@ import {
   clearStagedFiles,
   clipboardText,
   outgoingOfferStatus,
+  relaySizeNotice,
   setAutoAccept,
   sharedNotice,
   stagedFiles,
@@ -60,12 +60,12 @@ export function NearbyRadar() {
   const clip = clipboardText.value;
   const offerStatus = outgoingOfferStatus.value;
   const shareBanner = sharedNotice.value;
+  const largeRelayBanner = relaySizeNotice.value;
   const status = nearbyStatus.value;
   const rescanning = isRescanning.value;
   const currentLobby = lobbyId.value;
   const currentSig = signalingState.value;
   const currentIce = iceState.value;
-  const currentErr = lastError.value;
 
   function handleAvatarTap(peer: PeerMeta) {
     playClick();
@@ -99,7 +99,7 @@ export function NearbyRadar() {
     nearbyScope.value === 'wifi' ? t.radar.scopeWifi : t.radar.scopeLobby;
 
   const signalLabel =
-    status === 'offline' || currentSig === 'error'
+    status === 'offline' && peersArr.length === 0
       ? t.radar.statusOffline
       : peersArr.length === 1
       ? t.radar.statusOneNearby
@@ -108,25 +108,24 @@ export function NearbyRadar() {
       : t.radar.statusScanning;
 
   const signalDotClass =
-    status === 'offline' || currentSig === 'error'
+    status === 'offline' && peersArr.length === 0
       ? 'bg-[var(--accent-airmail)]'
       : peersArr.length > 0
       ? 'bg-[var(--accent-cleared)]'
       : 'bg-[var(--accent-amber)] animate-pulse';
 
-  const hasConnectionIssue = currentIce === 'failed' || currentSig === 'error';
-
   function renderPeerCard(peer: PeerMeta, layout: 'orbit' | 'strip') {
     const isDraggingOver = dragTargetId === peer.id;
     const DeviceIcon = peer.kind === 'mobile' ? Smartphone : Laptop;
     const ping = pingResults[peer.id];
+    const isDirect = peer.transportMode === 'direct';
 
     return (
       <div
         key={`${layout}-${peer.id}`}
         className={cn(
           'avatar-pop-in flex flex-col items-center',
-          layout === 'strip' ? 'shrink-0 snap-start w-[130px]' : 'max-w-[130px]'
+          layout === 'strip' ? 'shrink-0 snap-start w-[132px]' : 'max-w-[132px]'
         )}
         onDragOver={(e) => {
           e.preventDefault();
@@ -142,15 +141,22 @@ export function NearbyRadar() {
           type="button"
           onClick={() => handleAvatarTap(peer)}
           className={cn(
-            'tactile-btn group relative flex flex-col items-center w-full max-w-[130px] rounded-[8px] border-2 px-2 py-2 cursor-pointer transition-all',
+            'tactile-btn group relative flex flex-col items-center w-full max-w-[132px] rounded-[8px] border-2 px-2 py-2 cursor-pointer transition-all',
             isDraggingOver
               ? 'border-[var(--accent-airmail)] bg-[var(--accent-airmail)]/15 scale-105'
-              : 'border-[var(--accent-cleared)] bg-[var(--surface-receipt)] hover:border-[var(--accent-airmail)]'
+              : isDirect
+              ? 'border-[var(--accent-cleared)] bg-[var(--surface-receipt)] hover:border-[var(--accent-airmail)]'
+              : 'border-[var(--accent-amber)] bg-[var(--surface-receipt)] hover:border-[var(--accent-airmail)]'
           )}
         >
           <div className="relative flex h-8 w-8 items-center justify-center rounded-full bg-[var(--surface-inset)] text-[var(--ink-primary)] border border-[var(--border-dashed)] shrink-0">
             <DeviceIcon size={16} strokeWidth={1.5} />
-            <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full bg-[var(--accent-cleared)] border border-[var(--surface-receipt)]" />
+            <span
+              className={cn(
+                'absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border border-[var(--surface-receipt)]',
+                isDirect ? 'bg-[var(--accent-cleared)]' : 'bg-[var(--accent-amber)]'
+              )}
+            />
           </div>
 
           <span className="mt-1 inline-flex items-center px-1.5 py-0.2 rounded-[3px] border border-[var(--border-dashed)] bg-[var(--surface-inset)] tabular-mono text-[9px] font-bold uppercase text-[var(--ink-secondary)]">
@@ -161,7 +167,19 @@ export function NearbyRadar() {
             {peer.name}
           </span>
 
-          <span className="tabular-mono text-[9px] uppercase text-[var(--ink-secondary)] truncate max-w-full">
+          {/* Smooth connection mode badge (Direct LAN / Relay Active) */}
+          <span
+            className={cn(
+              'mt-0.5 inline-flex items-center px-1.5 py-0.2 rounded-[3px] border tabular-mono text-[8px] font-bold uppercase',
+              isDirect
+                ? 'border-[var(--accent-cleared)] text-[var(--accent-cleared)] bg-[var(--accent-cleared)]/10'
+                : 'border-[var(--accent-amber)] text-[var(--accent-amber)] bg-[var(--accent-amber)]/10'
+            )}
+          >
+            {isDirect ? t.radar.badgeDirect : t.radar.badgeRelay}
+          </span>
+
+          <span className="mt-0.5 tabular-mono text-[9px] uppercase text-[var(--ink-secondary)] truncate max-w-full">
             {isDraggingOver
               ? t.radar.dropToSend
               : staged.length > 0
@@ -214,10 +232,7 @@ export function NearbyRadar() {
     );
   }
 
-  const cornerPositions = [
-    'top-1 left-1',
-    'bottom-1 right-1',
-  ];
+  const cornerPositions = ['top-1 left-1', 'bottom-1 right-1'];
 
   return (
     <ReceiptCard airmailTop className="p-3.5 sm:p-5">
@@ -246,10 +261,10 @@ export function NearbyRadar() {
               size={17}
               strokeWidth={1.5}
               className={
-                currentSig === 'error' || status === 'offline'
-                  ? 'text-[var(--accent-airmail)] shrink-0'
-                  : peersArr.length > 0
+                peersArr.length > 0
                   ? 'text-[var(--accent-cleared)] shrink-0'
+                  : status === 'offline'
+                  ? 'text-[var(--accent-airmail)] shrink-0'
                   : 'text-[var(--accent-amber)] animate-pulse shrink-0'
               }
             />
@@ -260,7 +275,7 @@ export function NearbyRadar() {
 
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="inline-flex items-center gap-1 tabular-mono text-[10px] font-bold uppercase px-2 py-0.5 rounded-[3px] border border-dashed border-[var(--border-dashed)] bg-[var(--surface-inset)] text-[var(--ink-secondary)]">
-              {status === 'offline' ? (
+              {status === 'offline' && peersArr.length === 0 ? (
                 <WifiOff size={11} strokeWidth={1.5} />
               ) : (
                 <Wifi size={11} strokeWidth={1.5} />
@@ -317,6 +332,26 @@ export function NearbyRadar() {
             aria-label="Dismiss"
             onClick={() => {
               sharedNotice.value = null;
+            }}
+            className="text-[var(--ink-secondary)] hover:text-[var(--ink-primary)] cursor-pointer shrink-0"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+      {/* Non-blocking advisory when sending > 25MB over Relay Active */}
+      {largeRelayBanner && (
+        <div className="mb-3 flex items-center justify-between gap-2 rounded-[5px] border border-dashed border-[var(--accent-amber)] bg-[var(--accent-amber)]/10 px-3 py-2 text-xs">
+          <div className="flex items-center gap-2 text-[var(--ink-primary)] min-w-0">
+            <Info size={14} className="text-[var(--accent-amber)] shrink-0" />
+            <span className="break-words">{largeRelayBanner}</span>
+          </div>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={() => {
+              relaySizeNotice.value = null;
             }}
             className="text-[var(--ink-secondary)] hover:text-[var(--ink-primary)] cursor-pointer shrink-0"
           >
@@ -414,34 +449,6 @@ export function NearbyRadar() {
             <p className="text-xs text-[var(--ink-secondary)] max-w-md mx-auto">
               {t.radar.emptyBody}
             </p>
-          </div>
-        )}
-
-        {/* ICE / Signaling error banner + Retry button */}
-        {hasConnectionIssue && (
-          <div className="rounded-[5px] border border-dashed border-[var(--accent-airmail)] bg-[var(--accent-airmail)]/10 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-            <div className="flex items-start gap-2 min-w-0">
-              <AlertTriangle size={15} className="text-[var(--accent-airmail)] shrink-0 mt-0.5" />
-              <div className="text-xs space-y-0.5 min-w-0">
-                <p className="font-bold text-[var(--ink-primary)]">
-                  {t.radar.diagErrorHint}
-                </p>
-                {currentErr && (
-                  <p className="tabular-mono text-[11px] text-[var(--accent-airmail)] break-words">
-                    {currentErr}
-                  </p>
-                )}
-              </div>
-            </div>
-            <TactileButton
-              size="sm"
-              variant="primary"
-              onClick={() => rescanNearbyDiscovery({ forceReconnect: true })}
-              className="w-full sm:w-auto min-h-[40px] shrink-0"
-            >
-              <RefreshCw size={13} strokeWidth={1.5} />
-              <span>{t.radar.retryConnection}</span>
-            </TactileButton>
           </div>
         )}
 

@@ -1,4 +1,5 @@
 import { computeSha256Hex } from './crypto';
+import { dict, locale } from './i18n';
 import {
   deviceName,
   localDeviceKind,
@@ -7,12 +8,19 @@ import {
 import {
   getAllActiveBundles,
   getPeerConnection,
-  getPeerRoomContext,
+  getPeerTransportContext,
   registerP2PActionHook,
+  registerRelayMessageHandler,
+  resolveClientId,
+  type ClipPayload,
   type OfferPayload,
+  type OfferReplyPayload,
   type RoomBundle,
+  type TransferAckPayload,
+  type TransferCancelPayload,
   type TransferMetaPayload,
 } from './p2p';
+import { base64ToBytes, bytesToBase64, type RelayEnvelope } from './relayTunnel';
 import { playChime, playStamp } from './sound';
 import { peerList, peers } from '../state/p2pState';
 import {
@@ -25,13 +33,17 @@ import {
   enqueueIncomingOffer,
   outgoingOfferStatus,
   pendingOffer,
+  relaySizeNotice,
   removeActiveTransfer,
   shiftIncomingOffer,
   updateManifestVerification,
   upsertActiveTransfer,
 } from '../state/transferState';
 
-export const CHUNK_SIZE = 64 * 1024; // 64KB chunks
+export const CHUNK_SIZE = 64 * 1024; // 64KB direct WebRTC chunks
+const RELAY_CHUNK_SIZE = 16 * 1024; // 16KB encrypted MQTT relay chunks
+const RELAY_CHUNK_DELAY_MS = 25;
+const RELAY_LARGE_FILE_BYTES = 25 * 1024 * 1024;
 const BUFFERED_LOW_THRESHOLD = 64 * 1024;
 const BUFFERED_HIGH_WATER = 512 * 1024;
 const BULK_CHANNEL_ID = 777;
@@ -40,7 +52,7 @@ const OFFER_TIMEOUT_MS = 45000;
 
 interface IncomingTransferBuffer {
   meta: TransferMetaPayload;
-  peerId: string;
+  clientId: string;
   peerName: string;
   chunks: Array<Uint8Array | undefined>;
   receivedCount: number;
@@ -59,10 +71,12 @@ const cancelledOutgoing = new Set<string>();
 const bulkChannels = new Map<string, RTCDataChannel>();
 const outgoingOfferResolvers = new Map<string, PendingOutgoingOfferResolver>();
 const hookedBundles = new WeakSet<RoomBundle>();
+const seenClipIds = new Set<string>();
+const seenOfferIds = new Set<string>();
 let engineInitialized = false;
 
-function getPeerName(peerId: string): string {
-  return peers.value[peerId]?.name || `Courier-${peerId.slice(0, 4)}`;
+function getPeerName(clientId: string): string {
+  return peers.value[clientId]?.name || `Courier-${clientId.slice(0, 4)}`;
 }
 
 function makeId(): string {
@@ -98,12 +112,12 @@ function unpackBinaryFrame(buffer: ArrayBuffer): {
   return { transferId, chunkIndex, payload };
 }
 
-function ensureBulkDataChannel(peerId: string): RTCDataChannel | null {
-  const existing = bulkChannels.get(peerId);
+function ensureBulkDataChannel(clientId: string): RTCDataChannel | null {
+  const existing = bulkChannels.get(clientId);
   if (existing && existing.readyState !== 'closed') {
     return existing;
   }
-  const pc = getPeerConnection(peerId);
+  const pc = getPeerConnection(clientId);
   if (!pc || pc.connectionState === 'closed') return null;
 
   try {
@@ -123,11 +137,11 @@ function ensureBulkDataChannel(peerId: string): RTCDataChannel | null {
       }
     };
     dc.onclose = () => {
-      if (bulkChannels.get(peerId) === dc) {
-        bulkChannels.delete(peerId);
+      if (bulkChannels.get(clientId) === dc) {
+        bulkChannels.delete(clientId);
       }
     };
-    bulkChannels.set(peerId, dc);
+    bulkChannels.set(clientId, dc);
     return dc;
   } catch {
     return null;
@@ -164,8 +178,100 @@ function triggerAutoSave(objectUrl: string, fileName: string) {
     a.click();
     a.remove();
   } catch {
-    // non-fatal; manifest keeps the download button available
+    // non-fatal
   }
+}
+
+async function handleIncomingClip(payload: ClipPayload, senderClientId: string) {
+  if (!payload || typeof payload.text !== 'string') return;
+  if (payload.id && seenClipIds.has(payload.id)) return;
+  if (payload.id) {
+    seenClipIds.add(payload.id);
+    if (seenClipIds.size > 100) {
+      const first = seenClipIds.values().next().value;
+      if (first) seenClipIds.delete(first);
+    }
+  }
+
+  const sender = payload.senderName || getPeerName(senderClientId);
+  clipboardText.value = payload.text;
+  clipboardMeta.value = {
+    senderName: sender,
+    receivedAt: payload.sentAt || Date.now(),
+    isRemote: true,
+  };
+
+  if (autoCopyEnabled.value && payload.text.length > 0) {
+    try {
+      await navigator.clipboard.writeText(payload.text);
+      autoCopyWarning.value = null;
+    } catch {
+      autoCopyWarning.value = 'blocked';
+    }
+  }
+}
+
+function handleIncomingOffer(bundle: RoomBundle, offer: OfferPayload, senderClientId: string) {
+  if (!offer || !offer.offerId) return;
+  if (seenOfferIds.has(offer.offerId)) return;
+  seenOfferIds.add(offer.offerId);
+  if (seenOfferIds.size > 100) {
+    const first = seenOfferIds.values().next().value;
+    if (first) seenOfferIds.delete(first);
+  }
+
+  if (autoAcceptEnabled.value) {
+    sendReplyToPeer(bundle, senderClientId, { offerId: offer.offerId, accepted: true });
+    return;
+  }
+
+  playChime();
+  enqueueIncomingOffer({
+    offerId: offer.offerId,
+    peerId: senderClientId,
+    peerName: offer.senderName || getPeerName(senderClientId),
+    peerKind: offer.senderKind || 'desktop',
+    peerOs: offer.senderOs || 'Web',
+    files: offer.files || [],
+    totalSize: offer.totalSize || 0,
+    isZipBundle: offer.isZipBundle,
+    receivedAt: Date.now(),
+  });
+}
+
+function handleIncomingOfferReply(reply: OfferReplyPayload) {
+  if (!reply?.offerId) return;
+  const pending = outgoingOfferResolvers.get(reply.offerId);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  outgoingOfferResolvers.delete(reply.offerId);
+  pending.resolve(Boolean(reply.accepted));
+}
+
+function handleIncomingMeta(meta: TransferMetaPayload, senderClientId: string) {
+  if (!meta || !meta.transferId || incomingMap.has(meta.transferId)) return;
+  const peerName = getPeerName(senderClientId);
+  incomingMap.set(meta.transferId, {
+    meta,
+    clientId: senderClientId,
+    peerName,
+    chunks: new Array<Uint8Array | undefined>(meta.totalChunks),
+    receivedCount: 0,
+    receivedBytes: 0,
+    startedAt: Date.now(),
+    cancelled: false,
+  });
+
+  upsertActiveTransfer({
+    id: meta.transferId,
+    direction: 'recv',
+    name: meta.name,
+    size: meta.size,
+    transferredBytes: 0,
+    speedMBps: 0,
+    etaSeconds: 0,
+    peerName,
+  });
 }
 
 function handleIncomingChunk(transferId: string, chunkIndex: number, payload: Uint8Array) {
@@ -201,6 +307,27 @@ function handleIncomingChunk(transferId: string, chunkIndex: number, payload: Ui
   if (entry.receivedCount >= entry.meta.totalChunks) {
     finalizeIncomingTransfer(transferId, speedMBps);
   }
+}
+
+function handleIncomingAck(ack: TransferAckPayload) {
+  if (!ack?.transferId || !ack.done) return;
+  updateManifestVerification(
+    ack.transferId,
+    ack.verified ? 'verified' : ack.sha256 ? 'mismatch' : 'unverified',
+    ack.sha256
+  );
+  if (ack.verified) playStamp();
+}
+
+function handleIncomingCancel(payload: TransferCancelPayload) {
+  if (!payload?.transferId) return;
+  cancelledOutgoing.add(payload.transferId);
+  const inc = incomingMap.get(payload.transferId);
+  if (inc) {
+    inc.cancelled = true;
+    incomingMap.delete(payload.transferId);
+  }
+  removeActiveTransfer(payload.transferId);
 }
 
 async function finalizeIncomingTransfer(transferId: string, speedMBps: number) {
@@ -248,19 +375,27 @@ async function finalizeIncomingTransfer(transferId: string, speedMBps: number) {
 
   triggerAutoSave(objectUrl, entry.meta.name);
 
-  const ctx = getPeerRoomContext(entry.peerId);
-  if (ctx) {
-    ctx.bundle.actions.ack
-      .send(
-        {
-          transferId,
-          done: true,
-          verified: verification === 'verified',
-          sha256: localHash,
-        },
-        { target: entry.peerId }
-      )
-      .catch(() => {});
+  const ackPayload: TransferAckPayload = {
+    transferId,
+    done: true,
+    verified: verification === 'verified',
+    sha256: localHash,
+  };
+
+  const ctx = getPeerTransportContext(entry.clientId);
+  if (ctx?.mode === 'direct' && ctx.trysteroPeerId) {
+    ctx.bundle.actions.ack.send(ackPayload, { target: ctx.trysteroPeerId }).catch(() => {});
+  } else if (ctx) {
+    ctx.bundle.relay.send('ack', ackPayload, entry.clientId).catch(() => {});
+  }
+}
+
+function sendReplyToPeer(bundle: RoomBundle, clientId: string, reply: OfferReplyPayload) {
+  const ctx = getPeerTransportContext(clientId);
+  if (ctx?.mode === 'direct' && ctx.trysteroPeerId) {
+    ctx.bundle.actions.offerReply.send(reply, { target: ctx.trysteroPeerId }).catch(() => {});
+  } else {
+    bundle.relay.send('offerReply', reply, clientId).catch(() => {});
   }
 }
 
@@ -272,99 +407,39 @@ function attachRoomTransferListeners(bundle: RoomBundle) {
 
   room.onPeerJoin(
     ({ peerId }) => {
-      ensureBulkDataChannel(peerId);
+      const cid = resolveClientId(peerId);
+      ensureBulkDataChannel(cid);
     },
     { replay: true }
   );
 
   room.onPeerLeave(({ peerId }) => {
-    const dc = bulkChannels.get(peerId);
+    const cid = resolveClientId(peerId);
+    const dc = bulkChannels.get(cid);
     if (dc) {
       try {
         dc.close();
       } catch {
         // ignore
       }
-      bulkChannels.delete(peerId);
+      bulkChannels.delete(cid);
     }
   });
 
-  actions.clip.onMessage(async (payload, { peerId }) => {
-    if (!payload || typeof payload.text !== 'string') return;
-    const sender = payload.senderName || getPeerName(peerId);
-    clipboardText.value = payload.text;
-    clipboardMeta.value = {
-      senderName: sender,
-      receivedAt: payload.sentAt || Date.now(),
-      isRemote: true,
-    };
-
-    if (autoCopyEnabled.value && payload.text.length > 0) {
-      try {
-        await navigator.clipboard.writeText(payload.text);
-        autoCopyWarning.value = null;
-      } catch {
-        autoCopyWarning.value = 'blocked';
-      }
-    }
+  actions.clip.onMessage((payload, { peerId }) => {
+    handleIncomingClip(payload, resolveClientId(peerId));
   });
 
   actions.offer.onMessage((offer, { peerId }) => {
-    if (!offer || !offer.offerId) return;
-    if (autoAcceptEnabled.value) {
-      actions.offerReply
-        .send({ offerId: offer.offerId, accepted: true }, { target: peerId })
-        .catch(() => {});
-      return;
-    }
-
-    playChime();
-    enqueueIncomingOffer({
-      offerId: offer.offerId,
-      peerId,
-      peerName: offer.senderName || getPeerName(peerId),
-      peerKind: offer.senderKind || 'desktop',
-      peerOs: offer.senderOs || 'Web',
-      files: offer.files || [],
-      totalSize: offer.totalSize || 0,
-      isZipBundle: offer.isZipBundle,
-      receivedAt: Date.now(),
-    });
+    handleIncomingOffer(bundle, offer, resolveClientId(peerId));
   });
 
   actions.offerReply.onMessage((reply) => {
-    if (!reply?.offerId) return;
-    const pending = outgoingOfferResolvers.get(reply.offerId);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    outgoingOfferResolvers.delete(reply.offerId);
-    pending.resolve(Boolean(reply.accepted));
+    handleIncomingOfferReply(reply);
   });
 
   actions.meta.onMessage((meta, { peerId }) => {
-    if (!meta || !meta.transferId) return;
-    const peerName = getPeerName(peerId);
-    incomingMap.set(meta.transferId, {
-      meta,
-      peerId,
-      peerName,
-      chunks: new Array<Uint8Array | undefined>(meta.totalChunks),
-      receivedCount: 0,
-      receivedBytes: 0,
-      startedAt: Date.now(),
-      cancelled: false,
-    });
-
-    upsertActiveTransfer({
-      id: meta.transferId,
-      direction: 'recv',
-      name: meta.name,
-      size: meta.size,
-      transferredBytes: 0,
-      speedMBps: 0,
-      etaSeconds: 0,
-      peerName,
-    });
+    handleIncomingMeta(meta, resolveClientId(peerId));
   });
 
   actions.chunk.onMessage((bytes, { metadata }) => {
@@ -375,30 +450,49 @@ function attachRoomTransferListeners(bundle: RoomBundle) {
   });
 
   actions.ack.onMessage((ack) => {
-    if (!ack?.transferId || !ack.done) return;
-    updateManifestVerification(
-      ack.transferId,
-      ack.verified ? 'verified' : ack.sha256 ? 'mismatch' : 'unverified',
-      ack.sha256
-    );
-    if (ack.verified) playStamp();
+    handleIncomingAck(ack);
   });
 
   actions.cancel.onMessage((payload) => {
-    if (!payload?.transferId) return;
-    cancelledOutgoing.add(payload.transferId);
-    const inc = incomingMap.get(payload.transferId);
-    if (inc) {
-      inc.cancelled = true;
-      incomingMap.delete(payload.transferId);
-    }
-    removeActiveTransfer(payload.transferId);
+    handleIncomingCancel(payload);
   });
+}
+
+function handleRelayTransferMessage(bundle: RoomBundle, envelope: RelayEnvelope) {
+  const senderClientId = envelope.from;
+  switch (envelope.type) {
+    case 'clip':
+      handleIncomingClip(envelope.payload as ClipPayload, senderClientId);
+      break;
+    case 'offer':
+      handleIncomingOffer(bundle, envelope.payload as OfferPayload, senderClientId);
+      break;
+    case 'offerReply':
+      handleIncomingOfferReply(envelope.payload as OfferReplyPayload);
+      break;
+    case 'meta':
+      handleIncomingMeta(envelope.payload as TransferMetaPayload, senderClientId);
+      break;
+    case 'chunk': {
+      const p = envelope.payload as { t?: string; i?: number; b64?: string } | null;
+      if (p?.t && typeof p.i === 'number' && typeof p.b64 === 'string') {
+        handleIncomingChunk(p.t, p.i, base64ToBytes(p.b64));
+      }
+      break;
+    }
+    case 'ack':
+      handleIncomingAck(envelope.payload as TransferAckPayload);
+      break;
+    case 'cancel':
+      handleIncomingCancel(envelope.payload as TransferCancelPayload);
+      break;
+  }
 }
 
 export function initTransferEngine() {
   if (engineInitialized) return;
   engineInitialized = true;
+  registerRelayMessageHandler(handleRelayTransferMessage);
   registerP2PActionHook(attachRoomTransferListeners);
 }
 
@@ -407,12 +501,12 @@ export function respondToPendingOffer(accepted: boolean) {
   if (!current) return;
   shiftIncomingOffer();
 
-  const ctx = getPeerRoomContext(current.peerId);
-  if (ctx) {
-    ctx.bundle.actions.offerReply
-      .send({ offerId: current.offerId, accepted }, { target: current.peerId })
-      .catch(() => {});
-  }
+  const ctx = getPeerTransportContext(current.peerId);
+  if (!ctx) return;
+  sendReplyToPeer(ctx.bundle, current.peerId, {
+    offerId: current.offerId,
+    accepted,
+  });
 }
 
 export async function pushClipboardText(text: string) {
@@ -425,7 +519,7 @@ export async function pushClipboardText(text: string) {
     isRemote: false,
   };
 
-  const payload = {
+  const payload: ClipPayload = {
     id: makeId(),
     text,
     senderName: deviceName.value,
@@ -433,29 +527,37 @@ export async function pushClipboardText(text: string) {
   };
 
   await Promise.all(
-    bundles.map((b) => b.actions.clip.send(payload).catch(() => {}))
+    bundles.flatMap((b) => [
+      b.actions.clip.send(payload).catch(() => {}),
+      b.relay.send('clip', payload).catch(() => {}),
+    ])
   );
 }
 
-export async function pushClipboardToPeer(peerId: string, text: string) {
-  const ctx = getPeerRoomContext(peerId);
+export async function pushClipboardToPeer(clientId: string, text: string) {
+  const ctx = getPeerTransportContext(clientId);
   if (!ctx || !text) return;
+
   clipboardMeta.value = {
     senderName: deviceName.value,
     receivedAt: Date.now(),
     isRemote: false,
   };
-  await ctx.bundle.actions.clip
-    .send(
-      {
-        id: makeId(),
-        text,
-        senderName: deviceName.value,
-        sentAt: Date.now(),
-      },
-      { target: peerId }
-    )
-    .catch(() => {});
+
+  const payload: ClipPayload = {
+    id: makeId(),
+    text,
+    senderName: deviceName.value,
+    sentAt: Date.now(),
+  };
+
+  if (ctx.mode === 'direct' && ctx.trysteroPeerId) {
+    await ctx.bundle.actions.clip
+      .send(payload, { target: ctx.trysteroPeerId })
+      .catch(() => {});
+  } else {
+    await ctx.bundle.relay.send('clip', payload, clientId).catch(() => {});
+  }
 }
 
 export function cancelTransfer(transferId: string) {
@@ -468,16 +570,17 @@ export function cancelTransfer(transferId: string) {
   removeActiveTransfer(transferId);
   for (const b of getAllActiveBundles()) {
     b.actions.cancel.send({ transferId }).catch(() => {});
+    b.relay.send('cancel', { transferId }).catch(() => {});
   }
 }
 
 async function requestOfferApproval(
-  peerId: string,
+  clientId: string,
   peerName: string,
   files: File[],
   isZipBundle: boolean
 ): Promise<'accepted' | 'declined' | 'timeout'> {
-  const ctx = getPeerRoomContext(peerId);
+  const ctx = getPeerTransportContext(clientId);
   if (!ctx) return 'declined';
 
   const offerId = makeId();
@@ -508,7 +611,12 @@ async function requestOfferApproval(
       resolve: (accepted) => resolve(accepted ? 'accepted' : 'declined'),
     });
 
-    ctx.bundle.actions.offer.send(payload, { target: peerId }).catch(() => {
+    const sendPromise =
+      ctx.mode === 'direct' && ctx.trysteroPeerId
+        ? ctx.bundle.actions.offer.send(payload, { target: ctx.trysteroPeerId })
+        : ctx.bundle.relay.send('offer', payload, clientId);
+
+    sendPromise.catch(() => {
       clearTimeout(timer);
       outgoingOfferResolvers.delete(offerId);
       resolve('declined');
@@ -542,19 +650,18 @@ export async function sendFilesToPeers(
   const uniqueTargets = Array.from(new Set(candidateIds)).filter((id) => Boolean(peers.value[id]));
   if (uniqueTargets.length === 0) return;
 
-  // Ask each target peer for AirDrop-style acceptance first
   const acceptedPeers: string[] = [];
   await Promise.all(
-    uniqueTargets.map(async (peerId) => {
-      const peerName = getPeerName(peerId);
+    uniqueTargets.map(async (clientId) => {
+      const peerName = getPeerName(clientId);
       const decision = await requestOfferApproval(
-        peerId,
+        clientId,
         peerName,
         files,
         Boolean(options?.isZipBundle)
       );
       if (decision === 'accepted') {
-        acceptedPeers.push(peerId);
+        acceptedPeers.push(clientId);
       }
     })
   );
@@ -563,17 +670,24 @@ export async function sendFilesToPeers(
 
   for (const file of files) {
     const sha256 = await computeSha256Hex(file);
-    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
     const mime = file.type || 'application/octet-stream';
 
-    for (const peerId of acceptedPeers) {
-      const ctx = getPeerRoomContext(peerId);
+    for (const clientId of acceptedPeers) {
+      const ctx = getPeerTransportContext(clientId);
       if (!ctx) continue;
 
-      const peerName = getPeerName(peerId);
+      const useDirect = ctx.mode === 'direct' && Boolean(ctx.trysteroPeerId);
+      const chunkBytesSize = useDirect ? CHUNK_SIZE : RELAY_CHUNK_SIZE;
+      const totalChunks = Math.max(1, Math.ceil(file.size / chunkBytesSize));
+
+      if (!useDirect && file.size > RELAY_LARGE_FILE_BYTES) {
+        relaySizeNotice.value = dict[locale.value].radar.relayLargeFileHint;
+      }
+
+      const peerName = getPeerName(clientId);
       const transferId = makeId();
       const startedAt = Date.now();
-      const dc = ensureBulkDataChannel(peerId);
+      const dc = useDirect ? ensureBulkDataChannel(clientId) : null;
 
       const meta: TransferMetaPayload = {
         transferId,
@@ -596,7 +710,11 @@ export async function sendFilesToPeers(
         peerName,
       });
 
-      await ctx.bundle.actions.meta.send(meta, { target: peerId });
+      if (useDirect && ctx.trysteroPeerId) {
+        await ctx.bundle.actions.meta.send(meta, { target: ctx.trysteroPeerId });
+      } else {
+        await ctx.bundle.relay.send('meta', meta, clientId);
+      }
 
       let sentBytes = 0;
       let aborted = false;
@@ -607,13 +725,13 @@ export async function sendFilesToPeers(
           break;
         }
 
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(file.size, start + CHUNK_SIZE);
+        const start = i * chunkBytesSize;
+        const end = Math.min(file.size, start + chunkBytesSize);
         const sliceBuf =
           file.size === 0 ? new ArrayBuffer(0) : await file.slice(start, end).arrayBuffer();
         const chunkBytes = new Uint8Array(sliceBuf);
 
-        if (dc && dc.readyState === 'open') {
+        if (useDirect && dc && dc.readyState === 'open') {
           await waitForBufferDrain(dc);
           if (cancelledOutgoing.has(transferId)) {
             aborted = true;
@@ -623,11 +741,18 @@ export async function sendFilesToPeers(
           const sendCopy = new Uint8Array(frame.byteLength);
           sendCopy.set(frame);
           dc.send(sendCopy.buffer);
-        } else {
+        } else if (useDirect && ctx.trysteroPeerId) {
           await ctx.bundle.actions.chunk.send(chunkBytes, {
-            target: peerId,
+            target: ctx.trysteroPeerId,
             metadata: { t: transferId, i },
           });
+        } else {
+          await ctx.bundle.relay.send(
+            'chunk',
+            { t: transferId, i, b64: bytesToBase64(chunkBytes) },
+            clientId
+          );
+          await new Promise<void>((r) => setTimeout(r, RELAY_CHUNK_DELAY_MS));
         }
 
         sentBytes += chunkBytes.byteLength;
