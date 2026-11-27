@@ -1,4 +1,10 @@
-import { joinRoom, type MessageAction, type Room } from 'trystero';
+import { App as CapApp } from '@capacitor/app';
+import {
+  getRelaySockets,
+  joinRoom,
+  type MessageAction,
+  type Room,
+} from '@trystero-p2p/mqtt';
 import { computeSha256Hex } from './crypto';
 import {
   deviceName,
@@ -13,20 +19,26 @@ import { playConnect } from './sound';
 import {
   connectionState,
   currentPin,
+  isRescanning,
+  lastRescanAt,
   nearbyPeers,
   nearbyScope,
   nearbyStatus,
   p2pError,
   pinPeers,
   selfPeerId,
+  signalingBrokerCount,
   type PeerMeta,
 } from '../state/p2pState';
 
 export interface HelloPayload {
+  peerId: string;
   name: string;
   kind: DeviceKind;
+  deviceType: DeviceKind;
   os: OsBadge;
   ready: boolean;
+  timestamp: number;
 }
 
 export interface ClipPayload {
@@ -99,12 +111,35 @@ export interface RoomBundle {
 type RoomHook = (bundle: RoomBundle) => void;
 
 const APP_ID = 'com.poordrops.app';
+const MQTT_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://test.mosquitto.org:8081/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+];
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+  ],
+  iceCandidatePoolSize: 4,
+};
+
+const IPV4_REGEX =
+  /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+const HEARTBEAT_MS = 2000;
+const STALE_PEER_MS = 7000;
+const GRACE_OFFLINE_MS = 5000;
 
 let nearbyBundle: RoomBundle | null = null;
+let nearbyGeneration = 0;
+let nearbyStartedAt = 0;
 let pinBundle: RoomBundle | null = null;
 let pinGeneration = 0;
 let nearbyHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let actionHook: RoomHook | null = null;
+let lifecycleRegistered = false;
+let lastWakeActionAt = 0;
 
 function buildActions(room: Room): P2PActions {
   return {
@@ -121,11 +156,29 @@ function buildActions(room: Room): P2PActions {
 
 function makeHelloPayload(): HelloPayload {
   return {
+    peerId: selfPeerId.value,
     name: deviceName.value,
     kind: localDeviceKind,
+    deviceType: localDeviceKind,
     os: localOsBadge,
     ready: true,
+    timestamp: Date.now(),
   };
+}
+
+function countOpenRelaySockets(): number {
+  try {
+    const sockets = getRelaySockets();
+    let open = 0;
+    for (const ws of Object.values(sockets)) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        open += 1;
+      }
+    }
+    return open;
+  } catch {
+    return 0;
+  }
 }
 
 export function registerP2PActionHook(hook: RoomHook) {
@@ -217,42 +270,121 @@ function removePeerRecord(source: 'nearby' | 'pin', peerId: string) {
   targetSignal.value = next;
 }
 
-async function resolveNearbyRoomId(): Promise<{ roomId: string; scope: 'wifi' | 'lobby' }> {
+function pruneStaleNearbyPeers() {
+  const now = Date.now();
+  const current = nearbyPeers.value;
+  let changed = false;
+  const next: Record<string, PeerMeta> = {};
+
+  for (const [id, peer] of Object.entries(current)) {
+    if (now - peer.lastSeen <= STALE_PEER_MS) {
+      next[id] = peer;
+    } else {
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    nearbyPeers.value = next;
+  }
+}
+
+async function fetchIpv4WithTimeout(
+  url: string,
+  parse: (res: Response) => Promise<string | null>,
+  timeoutMs = 1500
+): Promise<string | null> {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 1600);
-    const res = await fetch('https://api64.ipify.org?format=json', {
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(url, {
       cache: 'no-store',
       signal: controller.signal,
     });
-    clearTimeout(timeout);
-    if (res.ok) {
-      const data = (await res.json()) as { ip?: string };
-      if (data?.ip) {
-        const buf = new TextEncoder().encode(`poordrops-net:${data.ip}`);
-        const hash = await computeSha256Hex(buf.buffer);
-        if (hash) {
-          return {
-            roomId: `poordrops-nearby-v1-${hash.slice(0, 14)}`,
-            scope: 'wifi',
-          };
-        }
-      }
-    }
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const raw = (await parse(res))?.trim() ?? '';
+    return IPV4_REGEX.test(raw) ? raw : null;
   } catch {
-    // Fallback cleanly to shared lobby
+    return null;
   }
+}
+
+async function resolveNearbyRoomId(): Promise<{ roomId: string; scope: 'wifi' | 'lobby' }> {
+  // Force IPv4-only endpoints so phones (often IPv6) and laptops (IPv4) match on the same Wi-Fi router
+  const ip =
+    (await fetchIpv4WithTimeout('https://api4.ipify.org?format=json', async (res) => {
+      const data = (await res.json()) as { ip?: string };
+      return data?.ip ?? null;
+    })) ??
+    (await fetchIpv4WithTimeout('https://ipv4.icanhazip.com', async (res) => res.text()));
+
+  if (ip) {
+    const buf = new TextEncoder().encode(`poordrops-ipv4:${ip}`);
+    const hash = await computeSha256Hex(buf.buffer);
+    if (hash) {
+      return {
+        roomId: `poordrops-wifi-v2-${hash.slice(0, 14)}`,
+        scope: 'wifi',
+      };
+    }
+    return {
+      roomId: `poordrops-wifi-v2-${ip.replace(/\./g, '-')}`,
+      scope: 'wifi',
+    };
+  }
+
+  // Fallback: timezone + language + shared local mesh lobby
+  let tz = 'UTC';
+  try {
+    tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    tz = 'UTC';
+  }
+  const lang = (typeof navigator !== 'undefined' ? navigator.language : 'en')
+    .slice(0, 2)
+    .toLowerCase();
+  const seed = `poordrops-local-mesh-v2:${tz}:${lang}`;
+  const hash = await computeSha256Hex(new TextEncoder().encode(seed).buffer);
+  const suffix = hash ? hash.slice(0, 12) : `${tz}-${lang}`.replace(/[^a-zA-Z0-9-]/g, '_');
+
   return {
-    roomId: 'poordrops-nearby-v1-shared-lobby',
+    roomId: `poordrops-mesh-v2-${suffix}`,
     scope: 'lobby',
   };
 }
 
-export async function initNearbyDiscovery() {
-  if (nearbyBundle) return;
-  nearbyStatus.value = 'scanning';
+async function teardownNearbyRoom() {
+  nearbyGeneration += 1;
+  if (nearbyHeartbeatTimer) {
+    clearInterval(nearbyHeartbeatTimer);
+    nearbyHeartbeatTimer = null;
+  }
+  const prev = nearbyBundle;
+  nearbyBundle = null;
+  nearbyPeers.value = {};
+  if (prev) {
+    try {
+      await prev.room.leave();
+    } catch {
+      // ignore teardown errors
+    }
+  }
+}
+
+export async function initNearbyDiscovery(options?: { force?: boolean }) {
+  if (nearbyBundle && !options?.force) return;
+
+  if (options?.force) {
+    await teardownNearbyRoom();
+  }
+
+  const gen = ++nearbyGeneration;
+  nearbyStartedAt = Date.now();
+  nearbyStatus.value = typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'scanning';
 
   const { roomId, scope } = await resolveNearbyRoomId();
+  if (gen !== nearbyGeneration) return;
   nearbyScope.value = scope;
 
   try {
@@ -261,61 +393,179 @@ export async function initNearbyDiscovery() {
         appId: APP_ID,
         identity: 'none',
         password: `${roomId}-secret`,
+        relayConfig: { urls: MQTT_BROKERS },
+        rtcConfig: RTC_CONFIG,
+        trickleIce: true,
       },
       roomId
     );
+
+    if (gen !== nearbyGeneration) {
+      room.leave().catch(() => {});
+      return;
+    }
+
     const actions = buildActions(room);
     const bundle: RoomBundle = { source: 'nearby', room, actions };
     nearbyBundle = bundle;
 
     room.getSelf().then((self) => {
-      if (!selfPeerId.value) selfPeerId.value = self.peerId;
+      if (gen === nearbyGeneration && !selfPeerId.value) {
+        selfPeerId.value = self.peerId;
+      }
     }).catch(() => {});
 
-    room.ready.then(() => {
-      nearbyStatus.value = 'ready';
-    }).catch(() => {});
+    room.ready
+      .then(() => {
+        if (gen !== nearbyGeneration) return;
+        nearbyStatus.value = 'ready';
+        isRescanning.value = false;
+        signalingBrokerCount.value = countOpenRelaySockets();
+        actions.hello.send(makeHelloPayload()).catch(() => {});
+      })
+      .catch(() => {
+        if (gen === nearbyGeneration) {
+          isRescanning.value = false;
+        }
+      });
 
     actions.hello.onMessage((payload, { peerId }) => {
-      if (!payload) return;
+      if (gen !== nearbyGeneration || !payload) return;
       updatePeerRecord('nearby', peerId, {
         name: (payload.name || '').trim() || undefined,
-        kind: payload.kind,
+        kind: payload.deviceType || payload.kind,
         os: payload.os,
         ready: payload.ready,
       });
+      nearbyStatus.value = 'ready';
     });
 
     room.onPeerJoin(({ peerId }) => {
+      if (gen !== nearbyGeneration) return;
       const wasEmpty = Object.keys(nearbyPeers.value).length === 0;
       updatePeerRecord('nearby', peerId, {});
       nearbyStatus.value = 'ready';
+      isRescanning.value = false;
       if (wasEmpty) playConnect();
+      // Immediate presence beacon to the newly joined peer
       actions.hello.send(makeHelloPayload(), { target: peerId }).catch(() => {});
     });
 
     room.onPeerLeave(({ peerId }) => {
+      if (gen !== nearbyGeneration) return;
       removePeerRecord('nearby', peerId);
     });
 
     room.onError((err) => {
+      if (gen !== nearbyGeneration) return;
       if (err.code === 'relay-failed' && Object.keys(nearbyPeers.value).length === 0) {
-        nearbyStatus.value = 'error';
+        nearbyStatus.value = 'offline';
+        isRescanning.value = false;
       }
     });
 
     if (nearbyHeartbeatTimer) clearInterval(nearbyHeartbeatTimer);
     nearbyHeartbeatTimer = setInterval(() => {
-      if (nearbyBundle && Object.keys(nearbyPeers.value).length > 0) {
+      if (gen !== nearbyGeneration || !nearbyBundle) return;
+
+      pruneStaleNearbyPeers();
+
+      const openCount = countOpenRelaySockets();
+      signalingBrokerCount.value = openCount;
+
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        nearbyStatus.value = 'offline';
+      } else if (openCount > 0 || Object.keys(nearbyPeers.value).length > 0) {
+        nearbyStatus.value = 'ready';
+      } else if (Date.now() - nearbyStartedAt > GRACE_OFFLINE_MS) {
+        nearbyStatus.value = 'offline';
+      }
+
+      if (openCount > 0 || Object.keys(nearbyPeers.value).length > 0) {
         nearbyBundle.actions.hello.send(makeHelloPayload()).catch(() => {});
       }
-    }, 5000);
+    }, HEARTBEAT_MS);
 
     if (actionHook) {
       actionHook(bundle);
     }
   } catch {
-    nearbyStatus.value = 'error';
+    nearbyStatus.value = 'offline';
+    isRescanning.value = false;
+  }
+}
+
+export async function rescanNearbyDiscovery(options?: { forceReconnect?: boolean }) {
+  const now = Date.now();
+  if (!options?.forceReconnect && now - lastRescanAt.value < 1200) {
+    return;
+  }
+  lastRescanAt.value = now;
+  isRescanning.value = true;
+  nearbyStatus.value = typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'scanning';
+
+  try {
+    await initNearbyDiscovery({ force: true });
+    if (pinBundle) {
+      pinBundle.actions.hello.send(makeHelloPayload()).catch(() => {});
+    }
+  } finally {
+    setTimeout(() => {
+      isRescanning.value = false;
+    }, 1500);
+  }
+}
+
+function handleWakeResume() {
+  const now = Date.now();
+  if (now - lastWakeActionAt < 1200) return;
+  lastWakeActionAt = now;
+
+  const openCount = countOpenRelaySockets();
+  if (
+    !nearbyBundle ||
+    openCount === 0 ||
+    nearbyStatus.value === 'offline'
+  ) {
+    rescanNearbyDiscovery({ forceReconnect: true });
+  } else {
+    nearbyBundle.actions.hello.send(makeHelloPayload()).catch(() => {});
+    if (pinBundle) {
+      pinBundle.actions.hello.send(makeHelloPayload()).catch(() => {});
+    }
+  }
+}
+
+export function registerLifecycleListeners() {
+  if (lifecycleRegistered || typeof window === 'undefined') return;
+  lifecycleRegistered = true;
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      handleWakeResume();
+    }
+  });
+
+  window.addEventListener('online', () => {
+    rescanNearbyDiscovery({ forceReconnect: true });
+  });
+
+  window.addEventListener('offline', () => {
+    nearbyStatus.value = 'offline';
+    signalingBrokerCount.value = 0;
+  });
+
+  try {
+    CapApp.addListener('appStateChange', ({ isActive }) => {
+      if (isActive) {
+        handleWakeResume();
+      }
+    }).catch(() => {});
+    CapApp.addListener('resume', () => {
+      handleWakeResume();
+    }).catch(() => {});
+  } catch {
+    // Non-Capacitor web environment
   }
 }
 
@@ -352,6 +602,9 @@ export async function joinPin(pin: string) {
         appId: APP_ID,
         identity: 'none',
         password: `poordrops-pin-${cleanPin}`,
+        relayConfig: { urls: MQTT_BROKERS },
+        rtcConfig: RTC_CONFIG,
+        trickleIce: true,
       },
       `poordrops-v1-${cleanPin}`
     );
@@ -382,7 +635,7 @@ export async function joinPin(pin: string) {
       const nextName = (payload.name || '').trim() || `Courier-${peerId.slice(0, 4)}`;
       updatePeerRecord('pin', peerId, {
         name: nextName,
-        kind: payload.kind,
+        kind: payload.deviceType || payload.kind,
         os: payload.os,
         ready: payload.ready,
       });
@@ -441,6 +694,7 @@ export async function createFreshRoom() {
 }
 
 export function initPairingFromUrl() {
+  registerLifecycleListeners();
   initNearbyDiscovery();
 
   if (typeof window === 'undefined') {
