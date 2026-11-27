@@ -4,6 +4,12 @@
 
 PoorDrops is a zero-server, peer-to-peer local file and live clipboard transfer app. Stop texting 40MB videos to your own WhatsApp chat, emailing yourself PDFs, or paying cloud storage subscriptions just to move a link from your laptop to your phone.
 
+## What's New in v1.2.0
+
+- **Sub-Second Local Wi-Fi Discovery (`@trystero-p2p/mqtt`):** Replaced slow signaling with redundant low-latency MQTT-over-WebSocket brokers (`emqx`, `mosquitto`, `hivemq`) + Google & Cloudflare STUN with `iceCandidatePoolSize: 4` for instant LAN candidate negotiation.
+- **IPv4 Subnet Matching:** Forces IPv4-only lookup (`api4.ipify.org` -> `ipv4.icanhazip.com`) so Android phones (often on IPv6) and laptops land in the exact same Wi-Fi radar room.
+- **1-Tap Rescan & Wake Auto-Reconnect:** Added an instant **Rescan** button, live signaling status badge, spring pop-in OS badges, 2s presence heartbeat with 7s stale pruning, and automatic beacon re-announcement on `visibilitychange` / `online` / Capacitor `appStateChange`.
+
 ## What's New in v1.1.0
 
 - **Nearby Devices Radar (Zero-PIN Auto-Discovery):** Automatically discovers devices nearby on startup and shows them on a postal-stamp circular radar. Tap an avatar or drag-and-drop files straight onto it to ship immediately.
