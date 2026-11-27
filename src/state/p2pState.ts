@@ -4,6 +4,7 @@ import type { DeviceKind, OsBadge } from '../lib/identity';
 export type ConnectionState = 'idle' | 'waiting' | 'connecting' | 'connected' | 'error';
 export type NearbyScope = 'wifi' | 'lobby';
 export type NearbyStatus = 'scanning' | 'ready' | 'offline';
+export type SignalingState = 'connecting' | 'connected' | 'error';
 
 export interface PeerMeta {
   id: string;
@@ -28,6 +29,11 @@ export const nearbyScope = signal<NearbyScope>('wifi');
 export const isRescanning = signal<boolean>(false);
 export const signalingBrokerCount = signal<number>(0);
 export const lastRescanAt = signal<number>(0);
+
+export const lobbyId = signal<string>('LOBBY-....');
+export const signalingState = signal<SignalingState>('connecting');
+export const iceState = signal<RTCIceConnectionState>('new');
+export const lastError = signal<string | null>(null);
 
 export const peers = computed<Record<string, PeerMeta>>(() => ({
   ...nearbyPeers.value,

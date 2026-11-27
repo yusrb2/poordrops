@@ -19,8 +19,11 @@ import { playConnect } from './sound';
 import {
   connectionState,
   currentPin,
+  iceState,
   isRescanning,
+  lastError,
   lastRescanAt,
+  lobbyId,
   nearbyPeers,
   nearbyScope,
   nearbyStatus,
@@ -28,6 +31,7 @@ import {
   pinPeers,
   selfPeerId,
   signalingBrokerCount,
+  signalingState,
   type PeerMeta,
 } from '../state/p2pState';
 
@@ -110,10 +114,9 @@ export interface RoomBundle {
 
 type RoomHook = (bundle: RoomBundle) => void;
 
-const APP_ID = 'com.poordrops.app';
+const APP_ID = 'poordrops-p2p-v1';
 const MQTT_BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
-  'wss://test.mosquitto.org:8081/mqtt',
   'wss://broker.hivemq.com:8884/mqtt',
 ];
 const RTC_CONFIG: RTCConfiguration = {
@@ -121,15 +124,24 @@ const RTC_CONFIG: RTCConfiguration = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
-  iceCandidatePoolSize: 4,
+  iceCandidatePoolSize: 6,
 };
 
 const IPV4_REGEX =
   /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 const HEARTBEAT_MS = 2000;
 const STALE_PEER_MS = 7000;
-const GRACE_OFFLINE_MS = 5000;
+const GRACE_OFFLINE_MS = 5500;
 
 let nearbyBundle: RoomBundle | null = null;
 let nearbyGeneration = 0;
@@ -140,6 +152,40 @@ let nearbyHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let actionHook: RoomHook | null = null;
 let lifecycleRegistered = false;
 let lastWakeActionAt = 0;
+
+const monitoredPcs = new WeakSet<RTCPeerConnection>();
+
+function attachIceMonitor(pc: RTCPeerConnection | null | undefined) {
+  if (!pc) return;
+  iceState.value = pc.iceConnectionState;
+  if (monitoredPcs.has(pc)) return;
+  monitoredPcs.add(pc);
+  pc.addEventListener('iceconnectionstatechange', () => {
+    iceState.value = pc.iceConnectionState;
+    if (pc.iceConnectionState === 'failed') {
+      lastError.value = 'ICE negotiation failed (check firewall or retry TURN).';
+    } else if (
+      pc.iceConnectionState === 'connected' ||
+      pc.iceConnectionState === 'completed'
+    ) {
+      lastError.value = null;
+    }
+  });
+}
+
+function scanRoomConnections(room: Room | null | undefined) {
+  if (!room) return;
+  try {
+    const peerMap = room.getPeers();
+    for (const info of Object.values(peerMap)) {
+      if (info?.connection) {
+        attachIceMonitor(info.connection);
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
 
 function buildActions(room: Room): P2PActions {
   return {
@@ -215,6 +261,20 @@ export function getPeerRoomContext(peerId: string): {
 
 export function getPeerConnection(peerId: string): RTCPeerConnection | null {
   return getPeerRoomContext(peerId)?.connection ?? null;
+}
+
+export async function pingPeer(peerId: string): Promise<number | null> {
+  const ctx = getPeerRoomContext(peerId);
+  if (!ctx) return null;
+  try {
+    const ms = await Promise.race<number | null>([
+      ctx.bundle.room.ping(peerId).then((r) => Math.max(1, Math.round(r))),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
+    ]);
+    return ms;
+  } catch {
+    return null;
+  }
 }
 
 export function buildShareUrl(pin: string): string {
@@ -310,31 +370,41 @@ async function fetchIpv4WithTimeout(
   }
 }
 
-async function resolveNearbyRoomId(): Promise<{ roomId: string; scope: 'wifi' | 'lobby' }> {
-  // Force IPv4-only endpoints so phones (often IPv6) and laptops (IPv4) match on the same Wi-Fi router
+export async function getLocalRadarRoomId(): Promise<{
+  roomId: string;
+  displayLobbyId: string;
+  scope: 'wifi' | 'lobby';
+}> {
+  // Primary: Cloudflare 1.1.1.1 IPv4 trace (fast, edge-cached, identical across mobile & desktop on same router)
   const ip =
+    (await fetchIpv4WithTimeout('https://1.1.1.1/cdn-cgi/trace', async (res) => {
+      const text = await res.text();
+      const match = text.match(/^ip=([^\r\n]+)$/m);
+      return match ? match[1] : null;
+    })) ??
     (await fetchIpv4WithTimeout('https://api4.ipify.org?format=json', async (res) => {
       const data = (await res.json()) as { ip?: string };
       return data?.ip ?? null;
-    })) ??
-    (await fetchIpv4WithTimeout('https://ipv4.icanhazip.com', async (res) => res.text()));
+    }));
 
   if (ip) {
     const buf = new TextEncoder().encode(`poordrops-ipv4:${ip}`);
     const hash = await computeSha256Hex(buf.buffer);
     if (hash) {
       return {
-        roomId: `poordrops-wifi-v2-${hash.slice(0, 14)}`,
+        roomId: `poordrops-lobby-${hash.slice(0, 12)}`,
+        displayLobbyId: `LOBBY-${hash.slice(0, 4).toUpperCase()}`,
         scope: 'wifi',
       };
     }
+    const compact = ip.split('.').slice(-2).join('');
     return {
-      roomId: `poordrops-wifi-v2-${ip.replace(/\./g, '-')}`,
+      roomId: `poordrops-lobby-${ip.replace(/\./g, '-')}`,
+      displayLobbyId: `LOBBY-${compact}`,
       scope: 'wifi',
     };
   }
 
-  // Fallback: timezone + language + shared local mesh lobby
   let tz = 'UTC';
   try {
     tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -349,7 +419,8 @@ async function resolveNearbyRoomId(): Promise<{ roomId: string; scope: 'wifi' | 
   const suffix = hash ? hash.slice(0, 12) : `${tz}-${lang}`.replace(/[^a-zA-Z0-9-]/g, '_');
 
   return {
-    roomId: `poordrops-mesh-v2-${suffix}`,
+    roomId: `poordrops-mesh-${suffix}`,
+    displayLobbyId: `MESH-${suffix.slice(0, 4).toUpperCase()}`,
     scope: 'lobby',
   };
 }
@@ -381,11 +452,15 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
 
   const gen = ++nearbyGeneration;
   nearbyStartedAt = Date.now();
-  nearbyStatus.value = typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'scanning';
+  const isOnline = typeof navigator === 'undefined' || navigator.onLine;
+  nearbyStatus.value = isOnline ? 'scanning' : 'offline';
+  signalingState.value = isOnline ? 'connecting' : 'error';
+  lastError.value = isOnline ? null : 'Device is offline.';
 
-  const { roomId, scope } = await resolveNearbyRoomId();
+  const { roomId, displayLobbyId, scope } = await getLocalRadarRoomId();
   if (gen !== nearbyGeneration) return;
   nearbyScope.value = scope;
+  lobbyId.value = displayLobbyId;
 
   try {
     const room = joinRoom(
@@ -419,13 +494,16 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
       .then(() => {
         if (gen !== nearbyGeneration) return;
         nearbyStatus.value = 'ready';
+        signalingState.value = 'connected';
         isRescanning.value = false;
         signalingBrokerCount.value = countOpenRelaySockets();
         actions.hello.send(makeHelloPayload()).catch(() => {});
       })
-      .catch(() => {
+      .catch((err) => {
         if (gen === nearbyGeneration) {
           isRescanning.value = false;
+          signalingState.value = 'error';
+          lastError.value = err instanceof Error ? err.message : 'Signaling ready failed.';
         }
       });
 
@@ -438,6 +516,7 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
         ready: payload.ready,
       });
       nearbyStatus.value = 'ready';
+      signalingState.value = 'connected';
     });
 
     room.onPeerJoin(({ peerId }) => {
@@ -445,9 +524,11 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
       const wasEmpty = Object.keys(nearbyPeers.value).length === 0;
       updatePeerRecord('nearby', peerId, {});
       nearbyStatus.value = 'ready';
+      signalingState.value = 'connected';
       isRescanning.value = false;
+      lastError.value = null;
+      scanRoomConnections(room);
       if (wasEmpty) playConnect();
-      // Immediate presence beacon to the newly joined peer
       actions.hello.send(makeHelloPayload(), { target: peerId }).catch(() => {});
     });
 
@@ -458,9 +539,15 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
 
     room.onError((err) => {
       if (gen !== nearbyGeneration) return;
-      if (err.code === 'relay-failed' && Object.keys(nearbyPeers.value).length === 0) {
-        nearbyStatus.value = 'offline';
-        isRescanning.value = false;
+      lastError.value = err.message || err.code;
+      if (err.code === 'relay-failed') {
+        signalingState.value = 'error';
+        if (Object.keys(nearbyPeers.value).length === 0) {
+          nearbyStatus.value = 'offline';
+          isRescanning.value = false;
+        }
+      } else if (err.code === 'peer-connect-failed') {
+        iceState.value = 'failed';
       }
     });
 
@@ -469,16 +556,24 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
       if (gen !== nearbyGeneration || !nearbyBundle) return;
 
       pruneStaleNearbyPeers();
+      scanRoomConnections(nearbyBundle.room);
+      scanRoomConnections(pinBundle?.room);
 
       const openCount = countOpenRelaySockets();
       signalingBrokerCount.value = openCount;
 
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         nearbyStatus.value = 'offline';
+        signalingState.value = 'error';
       } else if (openCount > 0 || Object.keys(nearbyPeers.value).length > 0) {
         nearbyStatus.value = 'ready';
+        signalingState.value = 'connected';
       } else if (Date.now() - nearbyStartedAt > GRACE_OFFLINE_MS) {
         nearbyStatus.value = 'offline';
+        signalingState.value = 'error';
+        if (!lastError.value) {
+          lastError.value = 'Unable to reach MQTT signaling brokers.';
+        }
       }
 
       if (openCount > 0 || Object.keys(nearbyPeers.value).length > 0) {
@@ -489,8 +584,10 @@ export async function initNearbyDiscovery(options?: { force?: boolean }) {
     if (actionHook) {
       actionHook(bundle);
     }
-  } catch {
+  } catch (err) {
     nearbyStatus.value = 'offline';
+    signalingState.value = 'error';
+    lastError.value = err instanceof Error ? err.message : 'Nearby discovery failed.';
     isRescanning.value = false;
   }
 }
@@ -502,7 +599,10 @@ export async function rescanNearbyDiscovery(options?: { forceReconnect?: boolean
   }
   lastRescanAt.value = now;
   isRescanning.value = true;
+  iceState.value = 'new';
+  lastError.value = null;
   nearbyStatus.value = typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'scanning';
+  signalingState.value = typeof navigator !== 'undefined' && !navigator.onLine ? 'error' : 'connecting';
 
   try {
     await initNearbyDiscovery({ force: true });
@@ -525,7 +625,8 @@ function handleWakeResume() {
   if (
     !nearbyBundle ||
     openCount === 0 ||
-    nearbyStatus.value === 'offline'
+    nearbyStatus.value === 'offline' ||
+    signalingState.value === 'error'
   ) {
     rescanNearbyDiscovery({ forceReconnect: true });
   } else {
@@ -552,7 +653,9 @@ export function registerLifecycleListeners() {
 
   window.addEventListener('offline', () => {
     nearbyStatus.value = 'offline';
+    signalingState.value = 'error';
     signalingBrokerCount.value = 0;
+    lastError.value = 'Network connection lost.';
   });
 
   try {
@@ -647,6 +750,8 @@ export async function joinPin(pin: string) {
       const firstConnect = Object.keys(pinPeers.value).length === 0;
       updatePeerRecord('pin', peerId, {});
       connectionState.value = 'connected';
+      lastError.value = null;
+      scanRoomConnections(room);
       saveLastRoom(cleanPin, pinPeers.value[peerId]?.name);
       if (firstConnect) playConnect();
       actions.hello.send(makeHelloPayload(), { target: peerId }).catch(() => {});
@@ -662,11 +767,14 @@ export async function joinPin(pin: string) {
 
     room.onError((err) => {
       if (gen !== pinGeneration) return;
+      p2pError.value = err.message;
+      lastError.value = err.message || err.code;
       if (err.code === 'relay-failed') {
-        p2pError.value = err.message;
         if (Object.keys(pinPeers.value).length === 0) {
           connectionState.value = 'error';
         }
+      } else if (err.code === 'peer-connect-failed') {
+        iceState.value = 'failed';
       }
     });
 
