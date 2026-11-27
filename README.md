@@ -4,6 +4,12 @@
 
 PoorDrops is a zero-server, peer-to-peer local file and live clipboard transfer app. Stop texting 40MB videos to your own WhatsApp chat, emailing yourself PDFs, or paying cloud storage subscriptions just to move a link from your laptop to your phone.
 
+## What's New in v1.2.2
+
+- **Multi-TURN + Encrypted MQTT Relay Tunnel:** Added redundant `openrelay.metered.ca` & `a.relay.metered.ca` TURN hosts (`iceCandidatePoolSize: 8`) plus an automatic AES-256-GCM encrypted MQTT Relay Tunnel (`16KB` backpressure chunks) when Mobile Hotspot Symmetric NAT or WebView mDNS blocks direct `RTCDataChannel`.
+- **Android File-Picker Stability:** Prevents temporary `visibilitychange` / `pagehide` backgrounding when opening the Android Gallery or File Picker from tearing down active P2P rooms, and sends immediate keep-alive beacons on resume.
+- **Clean `Direct LAN` & `Relay Active` Badges:** Replaced blocking hiccup alerts with subtle per-device transport mode pills while keeping file drops, Live Clipboard, and Ping 100% operational in both modes.
+
 ## What's New in v1.2.1
 
 - **Free TURN Relay Servers (`openrelay.metered.ca`):** Added port 80/443 UDP & TCP TURN relay configuration alongside Google and Cloudflare STUN (`iceCandidatePoolSize: 6`) to punch through Windows Firewall and Wi-Fi Client Isolation.
