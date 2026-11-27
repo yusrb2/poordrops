@@ -4,6 +4,12 @@
 
 PoorDrops is a zero-server, peer-to-peer local file and live clipboard transfer app. Stop texting 40MB videos to your own WhatsApp chat, emailing yourself PDFs, or paying cloud storage subscriptions just to move a link from your laptop to your phone.
 
+## What's New in v1.2.1
+
+- **Free TURN Relay Servers (`openrelay.metered.ca`):** Added port 80/443 UDP & TCP TURN relay configuration alongside Google and Cloudflare STUN (`iceCandidatePoolSize: 6`) to punch through Windows Firewall and Wi-Fi Client Isolation.
+- **Unified Web & Android Signaling (`poordrops-p2p-v1`):** Identical `trystero/mqtt` brokers (`emqx`, `hivemq`) and `1.1.1.1/cdn-cgi/trace` IPv4 matching so desktop and mobile always land in the same `LOBBY-XXXX` room.
+- **Live ICE & Signaling Diagnostics + P2P Ping:** Real-time `Room · Signal · ICE` status bar, full-width **Retry Connection** recovery banner, per-device **Ping** latency tester, and a clean mobile-first square radar layout (`360px`–`430px`).
+
 ## What's New in v1.2.0
 
 - **Sub-Second Local Wi-Fi Discovery (`@trystero-p2p/mqtt`):** Replaced slow signaling with redundant low-latency MQTT-over-WebSocket brokers (`emqx`, `mosquitto`, `hivemq`) + Google & Cloudflare STUN with `iceCandidatePoolSize: 4` for instant LAN candidate negotiation.
