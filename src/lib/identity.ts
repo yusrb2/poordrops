@@ -1,10 +1,14 @@
 import { signal } from '@preact/signals';
 
 const DEVICE_NAME_KEY = 'poordrops_device_name';
+const DEVICE_STAMP_KEY = 'poordrops_avatar_stamp';
 const LAST_ROOM_KEY = 'poordrops_last_room';
 
 export type DeviceKind = 'mobile' | 'desktop';
 export type OsBadge = 'Android' | 'iOS' | 'Windows' | 'macOS' | 'Linux' | 'Web';
+export type AvatarStampId = 'package' | 'send' | 'compass' | 'truck' | 'mail' | 'stamp';
+
+const VALID_STAMPS: AvatarStampId[] = ['package', 'send', 'compass', 'truck', 'mail', 'stamp'];
 
 const ADJECTIVES = [
   'Cardboard',
@@ -132,8 +136,28 @@ function loadLastRoom(): LastRoomInfo | null {
   return null;
 }
 
+function loadDeviceStamp(): AvatarStampId {
+  try {
+    const saved = localStorage.getItem(DEVICE_STAMP_KEY) as AvatarStampId | null;
+    if (saved && VALID_STAMPS.includes(saved)) return saved;
+  } catch {
+    // ignore
+  }
+  return 'package';
+}
+
 export const deviceName = signal<string>(loadDeviceName());
+export const deviceStamp = signal<AvatarStampId>(loadDeviceStamp());
 export const lastRoom = signal<LastRoomInfo | null>(loadLastRoom());
+
+export function updateDeviceStamp(stamp: AvatarStampId) {
+  deviceStamp.value = stamp;
+  try {
+    localStorage.setItem(DEVICE_STAMP_KEY, stamp);
+  } catch {
+    // ignore
+  }
+}
 
 export function updateDeviceName(next: string): string {
   const cleaned = next.trim().replace(/\s+/g, '-').slice(0, 32) || generateCargoAlias();

@@ -7,11 +7,14 @@ import {
   Radio,
   RefreshCw,
   Share2,
+  Shield,
+  ShieldCheck,
   Smartphone,
   Wifi,
   WifiOff,
   X,
 } from 'lucide-preact';
+import { STAMP_ICONS } from './DeviceBadge';
 import { ReceiptCard } from './ui/ReceiptCard';
 import { Switch } from './ui/Switch';
 import { TactileButton } from './ui/TactileButton';
@@ -19,12 +22,17 @@ import { cn } from '../lib/cn';
 import { useT } from '../lib/i18n';
 import {
   deviceName,
-  localDeviceKind,
+  deviceStamp,
   localOsBadge,
 } from '../lib/identity';
 import { pingPeer, rescanNearbyDiscovery } from '../lib/p2p';
 import { playClick } from '../lib/sound';
 import { pushClipboardToPeer, sendFilesToPeers } from '../lib/transfer';
+import {
+  isTrustedCourier,
+  toggleTrustedCourier,
+  trustedCouriers,
+} from '../lib/trustedDevices';
 import {
   iceState,
   isRescanning,
@@ -66,6 +74,8 @@ export function NearbyRadar() {
   const currentLobby = lobbyId.value;
   const currentSig = signalingState.value;
   const currentIce = iceState.value;
+  void trustedCouriers.value;
+  const SelfStampIcon = STAMP_ICONS[deviceStamp.value];
 
   function handleAvatarTap(peer: PeerMeta) {
     playClick();
@@ -119,6 +129,7 @@ export function NearbyRadar() {
     const DeviceIcon = peer.kind === 'mobile' ? Smartphone : Laptop;
     const ping = pingResults[peer.id];
     const isDirect = peer.transportMode === 'direct';
+    const trusted = isTrustedCourier(peer.name, peer.id);
 
     return (
       <div
@@ -211,6 +222,24 @@ export function NearbyRadar() {
                 ? `${ping}ms`
                 : t.radar.pingBtn}
             </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              playClick();
+              toggleTrustedCourier(peer.name);
+            }}
+            className={cn(
+              'inline-flex items-center gap-1 px-2 py-1 rounded-[4px] border tabular-mono text-[10px] font-bold cursor-pointer',
+              trusted
+                ? 'border-[var(--accent-cleared)] bg-[var(--accent-cleared)]/12 text-[var(--accent-cleared)]'
+                : 'border-[var(--border-dashed)] bg-[var(--surface-receipt)] text-[var(--ink-secondary)] hover:border-[var(--accent-airmail)]'
+            )}
+          >
+            {trusted ? <ShieldCheck size={10} /> : <Shield size={10} />}
+            <span>{trusted ? t.radar.trustedBadge : t.radar.trustBtn}</span>
           </button>
 
           {clip.trim().length > 0 && (
@@ -402,11 +431,7 @@ export function NearbyRadar() {
           {/* Center self stamp */}
           <div className="relative z-10 flex flex-col items-center text-center max-w-[130px] px-1">
             <div className="h-12 w-12 sm:h-14 sm:w-14 rounded-full border-2 border-[var(--ink-primary)] bg-[var(--surface-receipt)] shadow-[0_3px_0_var(--shadow-card)] flex items-center justify-center text-[var(--accent-airmail)]">
-              {localDeviceKind === 'mobile' ? (
-                <Smartphone size={22} strokeWidth={1.5} />
-              ) : (
-                <Laptop size={22} strokeWidth={1.5} />
-              )}
+              <SelfStampIcon size={22} strokeWidth={1.5} />
             </div>
             <span className="mt-1.5 tabular-mono text-[9px] sm:text-[10px] font-bold uppercase px-1.5 py-0.5 rounded-[3px] bg-[var(--ink-primary)] text-[var(--surface-receipt)]">
               {t.radar.youLabel} · {localOsBadge}

@@ -22,6 +22,7 @@ import {
 } from './p2p';
 import { base64ToBytes, bytesToBase64, type RelayEnvelope } from './relayTunnel';
 import { playChime, playStamp } from './sound';
+import { isTrustedCourier } from './trustedDevices';
 import { peerList, peers } from '../state/p2pState';
 import {
   addManifestItem,
@@ -220,7 +221,7 @@ function handleIncomingOffer(bundle: RoomBundle, offer: OfferPayload, senderClie
     if (first) seenOfferIds.delete(first);
   }
 
-  if (autoAcceptEnabled.value) {
+  if (autoAcceptEnabled.value || isTrustedCourier(offer.senderName, senderClientId)) {
     sendReplyToPeer(bundle, senderClientId, { offerId: offer.offerId, accepted: true });
     return;
   }
@@ -346,6 +347,14 @@ async function finalizeIncomingTransfer(transferId: string, speedMBps: number) {
   const mime = entry.meta.mime || 'application/octet-stream';
   const blob = new Blob(blobParts, { type: mime });
   const localHash = await computeSha256Hex(blob);
+  let textContent: string | undefined;
+  if (mime.startsWith('text/') && blob.size <= 512 * 1024) {
+    try {
+      textContent = await blob.text();
+    } catch {
+      textContent = undefined;
+    }
+  }
 
   let verification: 'verified' | 'mismatch' | 'unverified' = 'unverified';
   if (localHash && entry.meta.sha256) {
@@ -366,6 +375,7 @@ async function finalizeIncomingTransfer(transferId: string, speedMBps: number) {
     timestamp: Date.now(),
     peerName: entry.peerName,
     objectUrl,
+    textContent,
     isZipBundle: entry.meta.isZipBundle,
   });
 
@@ -783,7 +793,15 @@ export async function sendFilesToPeers(
 
       const totalElapsed = Math.max(0.05, (Date.now() - startedAt) / 1000);
       const finalSpeedMBps = file.size / totalElapsed / (1024 * 1024);
-      const objectUrl = file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined;
+      const objectUrl = URL.createObjectURL(file);
+      let textContent: string | undefined;
+      if (mime.startsWith('text/') && file.size <= 512 * 1024) {
+        try {
+          textContent = await file.text();
+        } catch {
+          textContent = undefined;
+        }
+      }
 
       addManifestItem({
         id: transferId,
@@ -797,6 +815,7 @@ export async function sendFilesToPeers(
         timestamp: Date.now(),
         peerName,
         objectUrl,
+        textContent,
         isZipBundle: options?.isZipBundle,
       });
       playStamp();

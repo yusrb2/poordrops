@@ -46,6 +46,7 @@ export interface ManifestItem {
   timestamp: number;
   peerName: string;
   objectUrl?: string;
+  textContent?: string;
   isZipBundle?: boolean;
 }
 
@@ -74,6 +75,7 @@ export interface OutgoingOfferStatus {
 
 export const stagedFiles = signal<File[]>([]);
 export const sharedNotice = signal<string | null>(null);
+export const sharedArrival = signal<{ fileCount: number; hasText: boolean } | null>(null);
 export const relaySizeNotice = signal<string | null>(null);
 
 export const clipboardText = signal<string>('');

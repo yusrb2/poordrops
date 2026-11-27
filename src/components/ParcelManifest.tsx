@@ -2,9 +2,11 @@ import { useState } from 'preact/hooks';
 import {
   Archive,
   Check,
+  Copy,
   Download,
-  Eye,
+  ExternalLink,
   FileText,
+  Forward,
   Receipt,
   Scissors,
 } from 'lucide-preact';
@@ -14,8 +16,11 @@ import { RubberStamp } from './ui/RubberStamp';
 import { Modal } from './ui/Modal';
 import { formatBytes } from '../lib/crypto';
 import { useT } from '../lib/i18n';
+import { playClick } from '../lib/sound';
 import {
+  addStagedFiles,
   manifestItems,
+  sharedNotice,
   shredManifest,
   type ManifestItem,
 } from '../state/transferState';
@@ -23,7 +28,7 @@ import {
 export function ParcelManifest() {
   const t = useT();
   const [previewItem, setPreviewItem] = useState<ManifestItem | null>(null);
-  const [copiedHashId, setCopiedHashId] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   const [shredNotice, setShredNotice] = useState(false);
 
   const items = manifestItems.value;
@@ -38,12 +43,58 @@ export function ParcelManifest() {
     a.remove();
   }
 
+  function openItem(item: ManifestItem) {
+    if (!item.objectUrl) return;
+    if (item.mime.startsWith('image/')) {
+      setPreviewItem(item);
+      return;
+    }
+    window.open(item.objectUrl, '_blank', 'noopener,noreferrer');
+  }
+
+  async function copyItemText(item: ManifestItem) {
+    let textToCopy = item.textContent;
+    if (!textToCopy && item.objectUrl && item.mime.startsWith('text/')) {
+      try {
+        const res = await fetch(item.objectUrl);
+        textToCopy = await res.text();
+      } catch {
+        textToCopy = undefined;
+      }
+    }
+    const fallback = `${item.name} (${formatBytes(item.size)})${item.sha256 ? ` · sha256:${item.sha256}` : ''}`;
+    try {
+      await navigator.clipboard.writeText(textToCopy ?? fallback);
+      setCopiedId(`txt-${item.id}`);
+      setTimeout(() => setCopiedId(null), 1500);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function forwardItem(item: ManifestItem) {
+    if (!item.objectUrl) return;
+    playClick();
+    try {
+      const res = await fetch(item.objectUrl);
+      const blob = await res.blob();
+      const file = new File([blob], item.name, {
+        type: item.mime || blob.type || 'application/octet-stream',
+      });
+      addStagedFiles([file]);
+      sharedNotice.value = t.manifest.forwardedNotice;
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch {
+      // ignore
+    }
+  }
+
   async function copyHash(item: ManifestItem) {
     if (!item.sha256) return;
     try {
       await navigator.clipboard.writeText(item.sha256);
-      setCopiedHashId(item.id);
-      setTimeout(() => setCopiedHashId(null), 1400);
+      setCopiedId(item.id);
+      setTimeout(() => setCopiedId(null), 1400);
     } catch {
       // ignore
     }
@@ -161,7 +212,7 @@ export function ParcelManifest() {
                               title={t.manifest.copyHash}
                               className="inline-flex items-center gap-1 hover:text-[var(--ink-primary)] cursor-pointer"
                             >
-                              {copiedHashId === item.id ? (
+                              {copiedId === item.id ? (
                                 <Check size={11} className="text-[var(--accent-cleared)]" />
                               ) : null}
                               <span>sha256:{item.sha256.slice(0, 10)}…</span>
@@ -172,17 +223,41 @@ export function ParcelManifest() {
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <div className="flex flex-wrap items-center gap-1.5 shrink-0">
                     <RubberStamp label={stampLabel} tone={stampTone} />
 
-                    {isImage && (
+                    {item.objectUrl && (
                       <TactileButton
                         size="sm"
                         variant="secondary"
-                        onClick={() => setPreviewItem(item)}
+                        onClick={() => openItem(item)}
                       >
-                        <Eye size={13} strokeWidth={1.5} />
-                        <span>{t.manifest.preview}</span>
+                        <ExternalLink size={13} strokeWidth={1.5} />
+                        <span>{t.manifest.openFile}</span>
+                      </TactileButton>
+                    )}
+
+                    <TactileButton
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => copyItemText(item)}
+                    >
+                      {copiedId === `txt-${item.id}` ? (
+                        <Check size={13} className="text-[var(--accent-cleared)]" />
+                      ) : (
+                        <Copy size={13} strokeWidth={1.5} />
+                      )}
+                      <span>{copiedId === `txt-${item.id}` ? t.pairing.copied : t.manifest.copyText}</span>
+                    </TactileButton>
+
+                    {item.objectUrl && (
+                      <TactileButton
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => forwardItem(item)}
+                      >
+                        <Forward size={13} strokeWidth={1.5} />
+                        <span>{t.manifest.forwardBtn}</span>
                       </TactileButton>
                     )}
 

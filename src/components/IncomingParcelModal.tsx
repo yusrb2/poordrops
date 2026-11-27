@@ -6,6 +6,11 @@ import { formatBytes } from '../lib/crypto';
 import { useT } from '../lib/i18n';
 import { respondToPendingOffer } from '../lib/transfer';
 import {
+  isTrustedCourier,
+  setCourierTrusted,
+  trustedCouriers,
+} from '../lib/trustedDevices';
+import {
   autoAcceptEnabled,
   pendingOffer,
   setAutoAccept,
@@ -14,6 +19,9 @@ import {
 export function IncomingParcelModal() {
   const t = useT();
   const offer = pendingOffer.value;
+  // Read trustedCouriers signal so toggle updates reactively
+  void trustedCouriers.value;
+  const senderTrusted = offer ? isTrustedCourier(offer.peerName, offer.peerId) : false;
 
   return (
     <Modal
@@ -79,14 +87,25 @@ export function IncomingParcelModal() {
             </span>
           </div>
 
-          <label className="flex items-center justify-between gap-2 text-xs text-[var(--ink-secondary)] cursor-pointer select-none">
-            <span>{t.incoming.autoAcceptInline}</span>
-            <Switch
-              checked={autoAcceptEnabled.value}
-              onCheckedChange={(checked) => setAutoAccept(checked)}
-              label={t.incoming.autoAcceptInline}
-            />
-          </label>
+          <div className="space-y-2">
+            <label className="flex items-center justify-between gap-2 text-xs text-[var(--ink-secondary)] cursor-pointer select-none">
+              <span>{t.incoming.trustSenderInline.replace('{name}', offer.peerName)}</span>
+              <Switch
+                checked={senderTrusted}
+                onCheckedChange={(checked) => setCourierTrusted(offer.peerName, checked)}
+                label={t.incoming.trustSenderInline.replace('{name}', offer.peerName)}
+              />
+            </label>
+
+            <label className="flex items-center justify-between gap-2 text-xs text-[var(--ink-secondary)] cursor-pointer select-none">
+              <span>{t.incoming.autoAcceptInline}</span>
+              <Switch
+                checked={autoAcceptEnabled.value}
+                onCheckedChange={(checked) => setAutoAccept(checked)}
+                label={t.incoming.autoAcceptInline}
+              />
+            </label>
+          </div>
 
           <div className="flex items-center gap-2.5 pt-1">
             <TactileButton

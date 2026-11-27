@@ -1,6 +1,7 @@
-import { useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import {
   Archive,
+  Camera,
   FileUp,
   PackagePlus,
   Send,
@@ -28,12 +29,25 @@ import {
 export function CargoDropzone() {
   const t = useT();
   const inputRef = useRef<HTMLInputElement>(null);
+  const cameraRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [bundling, setBundling] = useState(false);
+  const [autoZipOverride, setAutoZipOverride] = useState<boolean | null>(null);
 
   const connected = isConnected.value;
   const active = activeTransfers.value;
   const staged = stagedFiles.value;
+
+  const autoZipActive =
+    staged.length > 3
+      ? autoZipOverride !== false
+      : autoZipOverride === true;
+
+  useEffect(() => {
+    if (staged.length <= 3 && autoZipOverride !== null) {
+      setAutoZipOverride(null);
+    }
+  }, [staged.length]);
 
   function addFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
@@ -63,18 +77,52 @@ export function CargoDropzone() {
     }
   }
 
+  function handlePrimarySend() {
+    if (autoZipActive) {
+      handleBundleZip();
+    } else {
+      handleSendRaw();
+    }
+  }
+
   return (
     <ReceiptCard className="p-4 sm:p-5 flex flex-col justify-between gap-3">
       <div>
-        <div className="pb-2.5 mb-3 border-b border-dashed border-[var(--border-dashed)]">
-          <div className="flex items-center gap-2">
-            <PackagePlus size={16} strokeWidth={1.5} className="text-[var(--accent-airmail)]" />
-            <h2 className="font-display-tsuki text-lg font-bold text-[var(--ink-primary)]">
-              {t.cargo.title}
-            </h2>
+        <div className="flex flex-wrap items-start justify-between gap-2 pb-2.5 mb-3 border-b border-dashed border-[var(--border-dashed)]">
+          <div>
+            <div className="flex items-center gap-2">
+              <PackagePlus size={16} strokeWidth={1.5} className="text-[var(--accent-airmail)]" />
+              <h2 className="font-display-tsuki text-lg font-bold text-[var(--ink-primary)]">
+                {t.cargo.title}
+              </h2>
+            </div>
+            <p className="text-xs text-[var(--ink-secondary)] mt-0.5">{t.cargo.subtitle}</p>
           </div>
-          <p className="text-xs text-[var(--ink-secondary)] mt-0.5">{t.cargo.subtitle}</p>
+
+          <TactileButton
+            size="sm"
+            variant="secondary"
+            onClick={() => cameraRef.current?.click()}
+            title={t.cargo.takePhoto}
+          >
+            <Camera size={14} strokeWidth={1.5} />
+            <span>{t.cargo.takePhoto}</span>
+          </TactileButton>
         </div>
+
+        {/* Hidden quick camera capture input */}
+        <input
+          ref={cameraRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          className="hidden"
+          onChange={(e) => {
+            const target = e.target as HTMLInputElement;
+            addFiles(target.files);
+            target.value = '';
+          }}
+        />
 
         {/* Scale Dropzone */}
         <div
@@ -148,6 +196,24 @@ export function CargoDropzone() {
               </button>
             </div>
 
+            {staged.length > 3 && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-[4px] border border-dashed border-[var(--accent-cleared)] bg-[var(--accent-cleared)]/10 px-2.5 py-1.5 text-[11px]">
+                <span className="font-semibold text-[var(--ink-primary)]">
+                  {t.cargo.autoZipHint}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    playClick();
+                    setAutoZipOverride((prev) => (prev === false ? true : false));
+                  }}
+                  className="tabular-mono font-bold text-[var(--accent-airmail)] underline cursor-pointer shrink-0"
+                >
+                  {autoZipActive ? t.cargo.toggleRaw : t.cargo.toggleZip}
+                </button>
+              </div>
+            )}
+
             <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1">
               {staged.map((f, idx) => (
                 <div
@@ -187,24 +253,32 @@ export function CargoDropzone() {
         <div className="flex flex-wrap items-center gap-2">
           <TactileButton
             size="md"
-            variant="primary"
+            variant={autoZipActive ? 'cleared' : 'primary'}
             disabled={!connected || staged.length === 0 || bundling}
-            onClick={handleSendRaw}
+            onClick={handlePrimarySend}
             className="flex-1"
           >
-            <Send size={14} strokeWidth={1.5} />
-            <span>{t.cargo.sendUncompressed}</span>
+            {autoZipActive ? <Archive size={14} strokeWidth={1.5} /> : <Send size={14} strokeWidth={1.5} />}
+            <span>
+              {bundling
+                ? t.cargo.bundlingZip
+                : autoZipActive
+                ? t.cargo.sendAutoZip.replace('{n}', String(staged.length))
+                : t.cargo.sendUncompressed}
+            </span>
           </TactileButton>
 
-          <TactileButton
-            size="md"
-            variant={staged.length > 1 ? 'cleared' : 'secondary'}
-            disabled={!connected || staged.length === 0 || bundling}
-            onClick={handleBundleZip}
-          >
-            <Archive size={14} strokeWidth={1.5} />
-            <span>{bundling ? t.cargo.bundlingZip : t.cargo.bundleZip}</span>
-          </TactileButton>
+          {!autoZipActive && (
+            <TactileButton
+              size="md"
+              variant={staged.length > 1 ? 'cleared' : 'secondary'}
+              disabled={!connected || staged.length === 0 || bundling}
+              onClick={handleBundleZip}
+            >
+              <Archive size={14} strokeWidth={1.5} />
+              <span>{bundling ? t.cargo.bundlingZip : t.cargo.bundleZip}</span>
+            </TactileButton>
+          )}
         </div>
 
         {/* Live Transfers */}

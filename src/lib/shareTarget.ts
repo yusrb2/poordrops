@@ -3,6 +3,7 @@ import { dict, locale } from './i18n';
 import {
   addStagedFiles,
   clipboardText,
+  sharedArrival,
   sharedNotice,
 } from '../state/transferState';
 
@@ -29,8 +30,9 @@ interface WindowWithShareBridge extends Window {
   };
 }
 
-function notifyShareLoaded() {
+function notifyShareLoaded(fileCount: number, hasText: boolean) {
   sharedNotice.value = dict[locale.value].radar.shareReady;
+  sharedArrival.value = { fileCount, hasText };
 }
 
 async function consumeNativeAndroidShare() {
@@ -42,11 +44,12 @@ async function consumeNativeAndroidShare() {
     if (!raw) return;
     const payload = JSON.parse(raw) as NativeSharePayload;
 
-    let loadedSomething = false;
+    let hasText = false;
+    let fileCount = 0;
 
     if (payload.text && payload.text.trim().length > 0) {
       clipboardText.value = payload.text.trim();
-      loadedSomething = true;
+      hasText = true;
     }
 
     if (Array.isArray(payload.files) && payload.files.length > 0) {
@@ -69,12 +72,12 @@ async function consumeNativeAndroidShare() {
       }
       if (converted.length > 0) {
         addStagedFiles(converted);
-        loadedSomething = true;
+        fileCount = converted.length;
       }
     }
 
-    if (loadedSomething) {
-      notifyShareLoaded();
+    if (hasText || fileCount > 0) {
+      notifyShareLoaded(fileCount, hasText);
     }
   } catch {
     // ignore invalid JSON
@@ -95,11 +98,12 @@ async function consumePwaShareTarget() {
     if (!manifestRes) return;
 
     const manifest = (await manifestRes.json()) as PwaShareManifest;
-    let loadedSomething = false;
+    let hasText = false;
+    let fileCount = 0;
 
     if (manifest.text && manifest.text.trim().length > 0) {
       clipboardText.value = manifest.text.trim();
-      loadedSomething = true;
+      hasText = true;
     }
 
     if (Array.isArray(manifest.files) && manifest.files.length > 0) {
@@ -117,13 +121,13 @@ async function consumePwaShareTarget() {
       }
       if (loadedFiles.length > 0) {
         addStagedFiles(loadedFiles);
-        loadedSomething = true;
+        fileCount = loadedFiles.length;
       }
     }
 
     await cache.delete('/__shared_manifest');
-    if (loadedSomething) {
-      notifyShareLoaded();
+    if (hasText || fileCount > 0) {
+      notifyShareLoaded(fileCount, hasText);
     }
   } catch {
     // ignore cache errors
