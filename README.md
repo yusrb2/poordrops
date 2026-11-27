@@ -4,6 +4,12 @@
 
 PoorDrops is a zero-server, peer-to-peer local file and live clipboard transfer app. Stop texting 40MB videos to your own WhatsApp chat, emailing yourself PDFs, or paying cloud storage subscriptions just to move a link from your laptop to your phone.
 
+## What's New in v1.3.0
+
+- **3-Mode Tactile Routing Desk (`01 RADAR WI-FI` / `02 SCAN QR / PIN` / `03 BLUETOOTH`):** Separated Wi-Fi auto-discovery, cross-network QR/PIN pairing (with embedded in-app camera QR scanner), and offline Bluetooth into dedicated archival ticket tabs.
+- **Offline Bluetooth Transfer (`BluetoothTransferPlugin` + Web Bluetooth):** Native Android Bluetooth Share Sheet (universal OPP) + BLE device radar with analog RSSI bars, plus Web Bluetooth fallback and helpful guidance on desktop browsers.
+- **Share Sheet Routing & Core Daily Utilities:** Quick-routing banner when sharing from Android Gallery/File Manager, customizable permanent device nickname & postal avatar stamp, **Trusted Couriers** per-device auto-accept, **Take Photo** snap button, automatic ZIP bundling when staging 4+ files, and **Open / Copy Text / Forward** actions in Parcel Manifest.
+
 ## What's New in v1.2.2
 
 - **Multi-TURN + Encrypted MQTT Relay Tunnel:** Added redundant `openrelay.metered.ca` & `a.relay.metered.ca` TURN hosts (`iceCandidatePoolSize: 8`) plus an automatic AES-256-GCM encrypted MQTT Relay Tunnel (`16KB` backpressure chunks) when Mobile Hotspot Symmetric NAT or WebView mDNS blocks direct `RTCDataChannel`.
